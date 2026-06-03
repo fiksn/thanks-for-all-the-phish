@@ -32,7 +32,7 @@ def test_attacker_cannot_forge_with_header_alone():
     raw = (
         b"From: attacker@evil.com\n"
         b"Message-Id: <evil@host>\n"
-        b"X-Checked-By: thanks-for-the-phish\n"
+        b"X-Checked-By: thanks-for-all-the-phish\n"
         b"Subject: bypass attempt\n\nbody"
     )
     parsed = email.message_from_bytes(raw, policy=policy.default)
@@ -43,7 +43,7 @@ def test_attacker_cannot_forge_with_wrong_mac():
     raw = (
         b"From: attacker@evil.com\n"
         b"Message-Id: <evil@host>\n"
-        b"X-Checked-By: thanks-for-the-phish\n"
+        b"X-Checked-By: thanks-for-all-the-phish\n"
         b"X-Checked-Mac: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n"
         b"Subject: bypass attempt\n\nbody"
     )
@@ -56,7 +56,7 @@ def test_mac_binds_to_message_id():
     mac_a = loop_guard.compute_mac(_SECRET, "<a@host>")
     raw = (
         b"From: x@y\nMessage-Id: <b@host>\n"
-        b"X-Checked-By: thanks-for-the-phish\n"
+        b"X-Checked-By: thanks-for-all-the-phish\n"
         b"X-Checked-Mac: " + mac_a.encode() + b"\n"
         b"Subject: t\n\nbody"
     )

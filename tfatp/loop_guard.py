@@ -22,7 +22,7 @@ import hmac
 from email.message import Message
 from hashlib import sha256
 
-X_CHECKED_BY = "thanks-for-the-phish"
+X_CHECKED_BY = "thanks-for-all-the-phish"
 HEADER_CHECKED_BY = "X-Checked-By"
 HEADER_MAC = "X-Checked-Mac"
 

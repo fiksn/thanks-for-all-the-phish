@@ -44,8 +44,8 @@ involvement, no DWD, no Pub/Sub. Multi-user setup is covered further down.
 ### 1. Get the code running locally
 
 ```bash
-git clone <this repo>
-cd thanks-for-the-phish
+git clone git@github.com:fiksn/thanks-for-all-the-phish.git
+cd thanks-for-all-the-phish
 uv venv && uv sync && source .venv/bin/activate
 ```
 
@@ -317,7 +317,7 @@ The corrected `.eml`:
 
 - Preserves all original headers (`From`, `To`, `Subject`, `Date`, `Message-ID`,
   `References`, `In-Reply-To`).
-- Adds `X-Checked-By: thanks-for-the-phish`, `X-Checked-DKIM: ...`,
+- Adds `X-Checked-By: thanks-for-all-the-phish`, `X-Checked-DKIM: ...`,
   `X-Checked-Findings: ...`.
 - Body is `multipart/mixed`: part 1 is the annotated text, part 2 is the
   original message as a `message/rfc822` attachment named `original.eml`.

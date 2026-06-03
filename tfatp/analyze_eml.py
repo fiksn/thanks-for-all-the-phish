@@ -2,7 +2,7 @@
 
 Stdout: new .eml — original headers preserved, body replaced with an annotated
 version, the original message attached as message/rfc822, plus an
-`X-Checked-By: thanks-for-the-phish` header. Suitable to pipe into
+`X-Checked-By: thanks-for-all-the-phish` header. Suitable to pipe into
 `users.messages.insert` after deleting the original.
 
 Stderr: human-readable analysis report.
@@ -28,9 +28,13 @@ from tfatp.link_analysis import (
     LinkFinding,
     analyze,
     annotate,
+    annotate_html,
     defang,
+    defang_html,
     domain_age_days,
+    message_body,
     message_body_text,
+    neutralize_tracking_pixels,
     registrable_domain,
 )
 from tfatp.addr import extract_address
@@ -57,32 +61,84 @@ def _read_input(path: str | None) -> bytes:
     return sys.stdin.buffer.read()
 
 
+def _banner_lines(
+    smtp_result: SmtpVerifyResult | None,
+    sender_lookalike: LookalikeResult | None,
+    findings: list[LinkFinding],
+    neutralize_all: bool,
+) -> tuple[list[str], list[str]]:
+    """Build banner content as (top_lines, warning_lines).
+
+    DKIM is intentionally not surfaced: the signature belongs to the original
+    (attached) bytes and a reader can re-verify it independently.
+    """
+    top: list[str] = []
+    if sender_lookalike is not None and sender_lookalike.matched:
+        top.append(f"Sender impersonation: {sender_lookalike.detail}")
+    if smtp_result is not None:
+        suffix = " — all links defanged below" if neutralize_all else ""
+        top.append(f"SMTP: {smtp_result.status} ({smtp_result.detail}){suffix}")
+    warnings: list[str] = []
+    for f in findings:
+        if f.warnings:
+            shown = defang(f.url) if neutralize_all else f.url
+            warnings.append(f"{shown}  ({'; '.join(f.warnings)})")
+    # When defang escalates to the whole body, list the URLs that got neutered
+    # even when their finding had no per-link warning. Otherwise the recipient
+    # has no idea WHY the message is full of hxxps:// strings.
+    if neutralize_all:
+        for f in findings:
+            if not f.warnings and f.url and "://" in f.url:
+                warnings.append(f"{defang(f.url)}  (defanged: phase failed earlier)")
+    return top, warnings
+
+
 def _banner(
     smtp_result: SmtpVerifyResult | None,
     sender_lookalike: LookalikeResult | None,
     findings: list[LinkFinding],
     neutralize_all: bool = False,
 ) -> str:
-    # DKIM is intentionally not surfaced: the signature belongs to the original
-    # (attached) bytes and a reader can re-verify it independently.
-    lines = ["=== thanks-for-the-phish analysis ==="]
-    if sender_lookalike is not None and sender_lookalike.matched:
-        lines.append(f"Sender impersonation: {sender_lookalike.detail}")
-    if smtp_result is not None:
-        suffix = " — all links defanged below" if neutralize_all else ""
-        lines.append(f"SMTP: {smtp_result.status} ({smtp_result.detail}){suffix}")
-    suspect = [f for f in findings if f.warnings]
-    if suspect:
+    top, warnings = _banner_lines(smtp_result, sender_lookalike, findings, neutralize_all)
+    lines = ["=== thanks-for-all-the-phish analysis ==="]
+    lines.extend(top)
+    if warnings:
         lines.append("Warnings:")
-        for f in suspect:
-            shown = defang(f.url) if neutralize_all else f.url
-            lines.append(f"  - {shown}  ({'; '.join(f.warnings)})")
+        lines.extend(f"  - {w}" for w in warnings)
     else:
         lines.append("Warnings: none")
     lines.append("=== end analysis ===")
     lines.append("")
     lines.append("")
     return "\n".join(lines)
+
+
+def _banner_html(
+    smtp_result: SmtpVerifyResult | None,
+    sender_lookalike: LookalikeResult | None,
+    findings: list[LinkFinding],
+    neutralize_all: bool = False,
+) -> str:
+    import html as _html
+    top, warnings = _banner_lines(smtp_result, sender_lookalike, findings, neutralize_all)
+    parts = [
+        '<div style="border:2px solid #c00; background:#fff5f5; padding:12px; '
+        'margin:0 0 16px 0; font-family:Roboto,Arial,Helvetica,sans-serif; '
+        'font-size:14px; color:#222;">',
+        '<div style="font-weight:bold; color:#c00;">'
+        '=== thanks-for-all-the-phish analysis ===</div>',
+    ]
+    for line in top:
+        parts.append(f'<div>{_html.escape(line)}</div>')
+    if warnings:
+        parts.append('<div style="margin-top:6px;">Warnings:</div><ul style="margin:4px 0 0 0;">')
+        for w in warnings:
+            parts.append(f'<li>{_html.escape(w)}</li>')
+        parts.append('</ul>')
+    else:
+        parts.append('<div>Warnings: none</div>')
+    parts.append('</div>')
+    return "".join(parts)
 
 
 def build_corrected_eml(
@@ -93,6 +149,7 @@ def build_corrected_eml(
     sender_lookalike: LookalikeResult | None = None,
     neutralize_all: bool = False,
     loop_guard_secret: str = "",
+    body_subtype: str = "plain",
 ) -> bytes:
     # DKIM is deliberately not propagated into the rewritten message — the
     # signature applies to the original (attached) bytes; recomputing it on
@@ -120,9 +177,12 @@ def build_corrected_eml(
     if suspect_summary:
         new_msg["X-Checked-Findings"] = suspect_summary
 
-    new_msg.set_content(
-        _banner(smtp_result, sender_lookalike, findings, neutralize_all) + annotated_body
-    )
+    if body_subtype == "html":
+        banner = _banner_html(smtp_result, sender_lookalike, findings, neutralize_all)
+        new_msg.set_content(banner + annotated_body, subtype="html")
+    else:
+        banner = _banner(smtp_result, sender_lookalike, findings, neutralize_all)
+        new_msg.set_content(banner + annotated_body)
 
     # Attach the original message as a real message/rfc822 part so any reader
     # can recover the unmodified bytes.
@@ -134,6 +194,37 @@ def build_corrected_eml(
     )
 
     return bytes(new_msg)
+
+
+def rewrite_body(
+    body: str,
+    subtype: str,
+    findings: list[LinkFinding],
+    neutralize_all: bool,
+    per_url: set[str],
+) -> str:
+    """Annotate + defang the body, preserving the input subtype.
+
+    Plain text keeps the existing `[WARNING: ...]` inline tags and scheme
+    substitution. HTML keeps the original tree and mutates href/src/visible
+    URLs in place so the result still renders like the original phish — just
+    no longer clickable.
+    """
+    if subtype == "html":
+        annotated = annotate_html(body, findings)
+        annotated = defang_html(annotated, per_url, neutralize_all=neutralize_all)
+        # Tracking-pixel neutralization runs unconditionally on the rewrite
+        # path: by the time we get here the message has already been flagged,
+        # so there's no legitimate reason to let it phone home on open.
+        annotated, _ = neutralize_tracking_pixels(annotated)
+        return annotated
+    annotated = annotate(body, findings)
+    if neutralize_all:
+        return defang(annotated)
+    out = annotated
+    for url in per_url:
+        out = out.replace(url, defang(url))
+    return out
 
 
 def analyze_with_gate(
@@ -310,7 +401,8 @@ def run(raw: bytes, young_domain_days: int, quiet: bool,
         defang_policy: DefangPolicy | None = None,
         sender_lookalike_max_distance: int = 2,
         sender_min_domain_age_days: int = 365,
-        check_phases: tuple[tuple[str, ...], ...] | None = None) -> int:
+        check_phases: tuple[tuple[str, ...], ...] | None = None,
+        loop_guard_secret: str = "") -> int:
     defang_policy = defang_policy or DefangPolicy()
     phases = check_phases if check_phases is not None else _DEFAULT_CHECK_PHASES
     if not raw.strip():
@@ -318,7 +410,7 @@ def run(raw: bytes, young_domain_days: int, quiet: bool,
         return 2
 
     dkim_result = verify_dkim(raw)
-    body = message_body_text(raw)
+    body, body_subtype = message_body(raw)
     original = email.message_from_bytes(raw, policy=policy.default)
     (
         findings,
@@ -341,12 +433,7 @@ def run(raw: bytes, young_domain_days: int, quiet: bool,
     neutralize_all, per_url = compute_defang(
         findings, smtp_result, sender_lookalike, defang_policy
     )
-    annotated = annotate(body, findings)
-    if neutralize_all:
-        annotated = defang(annotated)
-    else:
-        for url in per_url:
-            annotated = annotated.replace(url, defang(url))
+    annotated = rewrite_body(body, body_subtype, findings, neutralize_all, per_url)
 
     if not quiet:
         print("=== message ===", file=sys.stderr)
@@ -395,6 +482,8 @@ def run(raw: bytes, young_domain_days: int, quiet: bool,
 
     corrected = build_corrected_eml(
         raw, annotated, findings, smtp_result, sender_lookalike, neutralize_all,
+        loop_guard_secret=loop_guard_secret,
+        body_subtype=body_subtype,
     )
     sys.stdout.buffer.write(corrected)
 
@@ -447,6 +536,13 @@ def main(argv: list[str]) -> int:
         help="Reject sender domains younger than this many days; unknown age "
         "counts as too young (default: 365).",
     )
+    p.add_argument(
+        "--loop-guard-secret",
+        default="",
+        help="HMAC key for X-Checked-Mac. If set, the rewritten .eml carries "
+        "a valid loop-guard stamp so it can be fed into replace_message and "
+        "skipped on the way back. Defaults to empty (no MAC header).",
+    )
     args = p.parse_args(argv)
     raw = _read_input(args.path)
 
@@ -466,6 +562,7 @@ def main(argv: list[str]) -> int:
         do_smtp_verify=args.smtp_verify,
         sender_lookalike_max_distance=args.sender_lookalike_distance,
         sender_min_domain_age_days=args.sender_min_domain_age_days,
+        loop_guard_secret=args.loop_guard_secret,
     )
 
 

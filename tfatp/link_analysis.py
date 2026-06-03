@@ -561,6 +561,36 @@ def html_to_text(html: str, reveal_hrefs: bool = True) -> str:
     return soup.get_text(separator="\n")
 
 
+def message_body(raw_rfc822: bytes) -> tuple[str, str]:
+    """Return (content, subtype) where subtype is 'html' or 'plain'.
+
+    HTML wins when both are present: it's the structure phishers actually
+    style, and preserving it keeps the rewritten message visually faithful
+    to the original. Falls back to plain text otherwise; ('', 'plain') if
+    neither part exists or both fail to decode.
+    """
+    msg = email.message_from_bytes(raw_rfc822, policy=policy.default)
+    plain: list[str] = []
+    html: list[str] = []
+    for part in msg.walk() if msg.is_multipart() else [msg]:
+        ct = part.get_content_type()
+        if ct == "text/plain":
+            try:
+                plain.append(part.get_content())
+            except (LookupError, UnicodeDecodeError):
+                pass
+        elif ct == "text/html":
+            try:
+                html.append(part.get_content())
+            except (LookupError, UnicodeDecodeError):
+                pass
+    if html:
+        return "\n".join(html), "html"
+    if plain:
+        return "\n".join(plain), "plain"
+    return "", "plain"
+
+
 def message_body_text(raw_rfc822: bytes, reveal_hrefs: bool = True) -> str:
     """Return a flattened text view of an RFC822 message.
 
@@ -603,6 +633,117 @@ def defang(text: str) -> str:
     for src, dst in _DEFANG.items():
         out = out.replace(src, dst)
     return out
+
+
+def defang_html(html: str, urls_to_defang: set[str], neutralize_all: bool) -> str:
+    """Defang URLs in an HTML body while preserving structure.
+
+    Two vectors get neutralized:
+      - `<a href>` — the click target; defanging the scheme breaks the click.
+      - URLs appearing as visible text inside any element.
+
+    `<img src>` is deliberately left alone: rewriting the scheme would just
+    break image rendering without preventing anything a user can act on.
+    Tracking-pixel suppression is a separate concern (strip the `<img>` tag
+    entirely if you want that) and doesn't belong in URL defang.
+
+    `neutralize_all=True` defangs every URL we can find; otherwise only those
+    in `urls_to_defang` are touched. The surrounding HTML (layout, fonts,
+    inline images of the brand we're impersonating) is left intact so the
+    rewritten message still looks like the original — just no longer clickable.
+    """
+    soup = _parse_html(html)
+
+    def hit(u: str) -> bool:
+        return neutralize_all or u in urls_to_defang
+
+    for a in soup.find_all("a", href=True):
+        if hit(_normalize_href(a["href"])):
+            a["href"] = defang(a["href"])
+    # Visible-text URLs. Walk text nodes once; skip script/style which can
+    # contain URL-shaped tokens that aren't meant to be clicked.
+    for txt in list(soup.find_all(string=True)):
+        if txt.parent is None or txt.parent.name in ("script", "style"):
+            continue
+        original = str(txt)
+        if "://" not in original:
+            continue
+        if neutralize_all:
+            replaced = defang(original)
+        else:
+            replaced = original
+            for u in urls_to_defang:
+                replaced = replaced.replace(u, defang(u))
+        if replaced != original:
+            txt.replace_with(replaced)
+    return str(soup)
+
+
+# Smallest possible transparent GIF (43 bytes). Used to replace tracking-pixel
+# src values so the tag still renders to a 1×1 invisible image but the client
+# never reaches out to the attacker's tracking endpoint. Data URIs don't fetch.
+_TRANSPARENT_1X1_GIF = (
+    "data:image/gif;base64,"
+    "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+)
+_HIDDEN_STYLE_RE = re.compile(
+    r"(?i)(?:display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0(?:\.0+)?\b)"
+)
+_SMALL_DIM_RE = re.compile(r"(?i)(?:width|height)\s*:\s*[01](?:px)?\b")
+
+
+def _is_tracking_pixel(img) -> bool:
+    """True when an `<img>` is shaped like a tracking beacon — 1×1, hidden,
+    or explicitly opaque-zero. False positives here would replace a legit
+    icon's src with a blank, so the rules are deliberately narrow."""
+    style = (img.get("style") or "").strip()
+    if style and _HIDDEN_STYLE_RE.search(style):
+        return True
+    w_attr = (img.get("width") or "").strip().lower()
+    h_attr = (img.get("height") or "").strip().lower()
+    if w_attr in ("0", "1") and h_attr in ("0", "1"):
+        return True
+    if style:
+        small_dims = _SMALL_DIM_RE.findall(style)
+        # Need both width AND height called out as tiny — a 1px border on an
+        # icon shouldn't trip this.
+        kinds = {m.split(":")[0].strip().lower() for m in small_dims}
+        if {"width", "height"}.issubset(kinds):
+            return True
+    return False
+
+
+def neutralize_tracking_pixels(html: str) -> tuple[str, int]:
+    """Replace each tracking-pixel `<img src>` with a transparent data URI.
+
+    Returns (rewritten_html, count_of_neutralized_images). The tag is kept in
+    place so the surrounding layout isn't disturbed; only the src is swapped.
+    """
+    soup = _parse_html(html)
+    count = 0
+    for img in soup.find_all("img", src=True):
+        if _is_tracking_pixel(img):
+            img["src"] = _TRANSPARENT_1X1_GIF
+            count += 1
+    return str(soup), count
+
+
+def annotate_html(html: str, findings: list[LinkFinding]) -> str:
+    """Insert a red warning marker after each `<a>` whose href appears in
+    `findings` with attached warnings. Leaves the anchor itself untouched."""
+    soup = _parse_html(html)
+    by_url = {f.url: f for f in findings if f.warnings}
+    for a in soup.find_all("a", href=True):
+        finding = by_url.get(_normalize_href(a["href"]))
+        if finding is None:
+            continue
+        marker = soup.new_tag(
+            "span",
+            attrs={"style": "color:#c00; font-weight:bold; font-size:90%;"},
+        )
+        marker.string = f" [WARNING: {'; '.join(finding.warnings)}]"
+        a.insert_after(marker)
+    return str(soup)
 
 
 def annotate(text: str, findings: list[LinkFinding]) -> str:

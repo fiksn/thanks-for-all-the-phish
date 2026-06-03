@@ -6,10 +6,10 @@ from email import policy
 
 from tfatp import loop_guard
 from tfatp.addr import extract_address, sender_allowed
-from tfatp.analyze_eml import analyze_with_gate, build_corrected_eml
+from tfatp.analyze_eml import analyze_with_gate, build_corrected_eml, rewrite_body
 from tfatp.client import GmailClient
 from tfatp.defang_policy import DefangPolicy, compute as compute_defang
-from tfatp.link_analysis import LinkFinding, annotate, defang, message_body_text
+from tfatp.link_analysis import LinkFinding, message_body
 
 __all__ = ["extract_address", "sender_allowed", "replace_message", "maybe_rewrite_new_mail"]
 
@@ -50,7 +50,7 @@ def maybe_rewrite_new_mail(
         return False, [], None
     from_header = str(parsed.get("From", ""))
 
-    body = message_body_text(raw)
+    body, body_subtype = message_body(raw)
     # HELO advertises a host on our side: use the domain of the recipient
     # mailbox we just received the message at, not the workspace-config knob.
     helo = client.user.split("@", 1)[1] if "@" in client.user else "localhost"
@@ -102,15 +102,11 @@ def maybe_rewrite_new_mail(
         sender_lookalike,
         defang_policy,
     )
-    annotated = annotate(body, findings)
-    if neutralize_all:
-        annotated = defang(annotated)
-    else:
-        for url in per_url:
-            annotated = annotated.replace(url, defang(url))
+    annotated = rewrite_body(body, body_subtype, findings, neutralize_all, per_url)
     new_raw = build_corrected_eml(
         raw, annotated, findings, smtp_result, sender_lookalike, neutralize_all,
         loop_guard_secret=cfg.loop_guard_secret,
+        body_subtype=body_subtype,
     )
 
     print(
