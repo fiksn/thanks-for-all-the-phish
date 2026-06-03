@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+client_secret*.json
+token.json
+config.toml
+.ruff_cache/
+dist/
+.claude/
+*.eml

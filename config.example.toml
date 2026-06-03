@@ -1,0 +1,105 @@
+# Copy to config.toml and edit.
+
+# Workspace domain (informational; OAuth is per-user).
+domain = "example.com"
+
+# Account to authenticate as (or to impersonate if using domain-wide delegation).
+user = "alice@example.com"
+
+# Auth mode: "oauth" (per-user consent) or "service_account" (domain-wide delegation).
+auth_mode = "oauth"
+
+# --- oauth mode ---
+# OAuth client secret JSON from Google Cloud Console (OAuth 2.0 client, Desktop type).
+client_secret_file = "client_secret.json"
+# Refresh token cache (created on first login).
+token_file = "token.json"
+
+# --- service_account mode (only used when auth_mode = "service_account") ---
+# Service account JSON key. The service account must have domain-wide delegation
+# enabled and be authorized in the Workspace admin console for the scopes below.
+service_account_file = "service_account.json"
+
+# How often to poll for new mail, in seconds (only used by --poll watcher).
+poll_interval = 15
+
+# Domains registered within this many days trigger the young-domain warning.
+young_domain_days = 365
+
+## When each check fires, what does it do to URLs in the displayed body?
+##   "no"   — disable the check entirely
+##   "yes"  — defang just the URL that tripped the check
+##   "all"  — defang every URL in the body (escalate to message-level)
+## "Sender" checks have no per-URL meaning; "yes" there behaves like "all".
+defang_on_smtp_fail           = "all"
+defang_on_password_form       = "all"
+defang_on_sender_lookalike    = "all"
+defang_on_sender_young_domain = "all"
+defang_on_young_domain        = "yes"
+defang_on_link_lookalike      = "all"
+defang_on_anchor_deception    = "yes"
+defang_on_macro               = "all"
+
+# Max Damerau-Levenshtein edits between sender label and user label (after
+# Unicode homoglyph normalization) that still counts as a lookalike.
+sender_lookalike_max_distance = 2
+
+# SMTP sender verification: probe the sender's MX (port 587 then 25), say HELO,
+# MAIL FROM (our address) + RCPT TO (the sender), then RSET and QUIT. We never
+# send DATA, so no mail is generated. Set to false to skip the network probe.
+# Some MX operators consider this abusive — use with judgement.
+smtp_verify = true
+
+# Reject sender domains younger than this many days (or with unknown age — an
+# unresolvable registration date is treated as "too young" for this check).
+sender_min_domain_age_days = 365
+
+# Ordered phases of checks. All checks in a phase run; if ANY check in a phase
+# is suspicious, every later phase is skipped — its checks are not run and
+# its network actions are not taken. The default cascade is:
+#   phase 0 — cheap data-only checks on the sender:
+#             sender_domain_age, sender_lookalike
+#   phase 1 — probe the sender's MX over SMTP (touches their server):
+#             smtp_verify
+#   phase 2 — data-only checks on each link's registrable domain:
+#             check_link_domain_age   (RDAP at rdap.org)
+#             check_link_lookalike    (vs recipient domain, no network)
+#   phase 3 — fetch every URL in the body to look for password forms and
+#             resolve redirectors (exposes your IP to the destination):
+#             check_password_form
+# Each stage may appear in at most one phase. Unknown stages are rejected.
+check_phases = [
+    ["sender_domain_age", "sender_lookalike"],
+    ["smtp_verify"],
+    ["check_link_domain_age", "check_link_lookalike"],
+    ["check_password_form"],
+]
+
+# Delete the original message and insert a rewritten copy when warnings are found.
+# DESTRUCTIVE: leave false until you trust the pipeline.
+auto_rewrite = false
+
+# Required when auto_rewrite is true. Used as the HMAC key that stamps every
+# inserted copy with an X-Checked-Mac header, so the watcher recognizes our
+# own rewrites and doesn't loop. A header-only marker would be trivially
+# forged by any sender — keep this secret. Generate one with either:
+#   openssl rand -base64 32
+#   python -c "import secrets; print(secrets.token_urlsafe(32))"
+loop_guard_secret = ""
+
+# Safety gate: only rewrite messages whose From: matches one of these addresses.
+# Use this while testing — send yourself a phishy-looking mail and verify the
+# round-trip before opening it up. Empty list = no restriction (apply to all senders).
+rewrite_only_from = ["alice@example.com"]
+
+# --- domain-wide (DWD) settings — only used by `python -m tfatp.cli.watch_domain` ---
+
+# Workspace super-admin to impersonate for the Admin SDK Directory API call that
+# lists users in the domain. Leave empty to skip user enumeration.
+admin_user = ""
+
+# Cloud Pub/Sub config for push-based new-mail notifications.
+# If any of these is empty, watch_domain falls back to the polling loop.
+pubsub_project_id = ""
+pubsub_topic = ""
+pubsub_subscription = ""
