@@ -10,8 +10,16 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from tfatp.config import Config
 
 # https://mail.google.com/ is required for messages.delete (permanent delete).
-# It also covers readonly + insert + modify, so a single scope is enough.
-SCOPES = ["https://mail.google.com/"]
+# It also covers readonly + insert + modify, so a single scope is enough for
+# the mail pipeline. `openid` + `userinfo.email` let us call the OIDC userinfo
+# endpoint to read `hd` (hosted domain), so org-domain classification works
+# even without DWD. Adding these to the SCOPES list invalidates older token
+# files — the next launch will prompt re-consent once.
+SCOPES = [
+    "https://mail.google.com/",
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+]
 _TOKEN_FILE_MODE = 0o600
 
 

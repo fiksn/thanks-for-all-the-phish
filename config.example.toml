@@ -39,6 +39,11 @@ defang_on_young_domain        = "yes"
 defang_on_link_lookalike      = "all"
 defang_on_anchor_deception    = "yes"
 defang_on_macro               = "all"
+# external_warning has no specific URL — "yes" behaves like "all" (whole body
+# defanged when the external_warning stage fires). Default "no" keeps the
+# yellow banner cosmetic; flip to "all" to also neuter every link in mail
+# from outside the org.
+defang_on_external            = "no"
 
 # Max Damerau-Levenshtein edits between sender label and user label (after
 # Unicode homoglyph normalization) that still counts as a lookalike.
@@ -57,23 +62,40 @@ sender_min_domain_age_days = 365
 # Ordered phases of checks. All checks in a phase run; if ANY check in a phase
 # is suspicious, every later phase is skipped — its checks are not run and
 # its network actions are not taken. The default cascade is:
-#   phase 0 — cheap data-only checks on the sender:
+#   phase 0 — informational only, never gates:
+#             external_warning        (yellow banner if sender outside org)
+#   phase 1 — cheap data-only checks on the sender:
 #             sender_domain_age, sender_lookalike
-#   phase 1 — probe the sender's MX over SMTP (touches their server):
+#   phase 2 — probe the sender's MX over SMTP (touches their server):
 #             smtp_verify
-#   phase 2 — data-only checks on each link's registrable domain:
+#   phase 3 — data-only checks on each link's registrable domain:
 #             check_link_domain_age   (RDAP at rdap.org)
 #             check_link_lookalike    (vs recipient domain, no network)
-#   phase 3 — fetch every URL in the body to look for password forms and
+#   phase 4 — fetch every URL in the body to look for password forms and
 #             resolve redirectors (exposes your IP to the destination):
 #             check_password_form
 # Each stage may appear in at most one phase. Unknown stages are rejected.
 check_phases = [
+    ["external_warning"],
     ["sender_domain_age", "sender_lookalike"],
     ["smtp_verify"],
     ["check_link_domain_age", "check_link_lookalike"],
     ["check_password_form"],
 ]
+
+# Phases used when the sender's domain is one of ours (workspace-owned).
+# Internal mail skips domain-age, SMTP probe, and lookalike checks by default
+# (they're noise for known senders). The `external_warning` stage is a no-op
+# here — by definition the sender is internal.
+check_phases_internal = [
+    ["check_password_form"],
+]
+
+# Yellow banner text rendered when the `external_warning` stage fires (sender
+# external + stage listed in check_phases above). Purely informational — it
+# never gates other phases. Remove `external_warning` from check_phases to
+# suppress the banner entirely.
+external_warning_text = "Sender is external to the organization, beware."
 
 # Delete the original message and insert a rewritten copy when warnings are found.
 # DESTRUCTIVE: leave false until you trust the pipeline.

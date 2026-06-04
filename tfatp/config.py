@@ -13,6 +13,7 @@ CHECK_STAGES = (
     "check_link_domain_age",
     "check_link_lookalike",
     "check_password_form",
+    "external_warning",
 )
 _DEFAULT_CHECK_PHASES: tuple[tuple[str, ...], ...] = (
     ("sender_domain_age", "sender_lookalike"),
@@ -20,6 +21,15 @@ _DEFAULT_CHECK_PHASES: tuple[tuple[str, ...], ...] = (
     ("check_link_domain_age", "check_link_lookalike"),
     ("check_password_form",),
 )
+# For mail whose sender domain is part of the workspace, the checks that
+# probe a sender's MX or measure their domain age are pointless — we already
+# know who they are. Lookalike checks (sender + link) also collapse to noise
+# because the sender domain *is* the protected domain. Default leaves just
+# the link-fetch step; ops can extend it via config.
+_DEFAULT_CHECK_PHASES_INTERNAL: tuple[tuple[str, ...], ...] = (
+    ("check_password_form",),
+)
+_DEFAULT_EXTERNAL_WARNING_TEXT = "Sender is external to the organization, beware."
 _BOOL_STRINGS = {
     "true": True,
     "false": False,
@@ -37,11 +47,16 @@ def _action(value: str | bool, field: str) -> str:
     return v
 
 
-def _check_phases(value: object) -> tuple[tuple[str, ...], ...]:
+def _check_phases(
+    value: object,
+    *,
+    field: str = "check_phases",
+    default: tuple[tuple[str, ...], ...] = _DEFAULT_CHECK_PHASES,
+) -> tuple[tuple[str, ...], ...]:
     if value is None:
-        return _DEFAULT_CHECK_PHASES
+        return default
     if not isinstance(value, list) or not all(isinstance(p, list) for p in value):
-        raise ValueError("check_phases must be a list of lists, e.g. [[\"a\",\"b\"],[\"c\"]]")
+        raise ValueError(f"{field} must be a list of lists, e.g. [[\"a\",\"b\"],[\"c\"]]")
     seen: set[str] = set()
     phases: list[tuple[str, ...]] = []
     for phase in value:
@@ -52,7 +67,7 @@ def _check_phases(value: object) -> tuple[tuple[str, ...], ...]:
                     f"unknown check stage {stage!r}; valid stages: {CHECK_STAGES!r}"
                 )
             if stage in seen:
-                raise ValueError(f"check stage {stage!r} appears in multiple phases")
+                raise ValueError(f"check stage {stage!r} appears in multiple phases of {field}")
             seen.add(stage)
             stages.append(stage)
         phases.append(tuple(stages))
@@ -106,9 +121,12 @@ class Config:
     defang_on_link_lookalike: str
     defang_on_anchor_deception: str
     defang_on_macro: str
+    defang_on_external: str
     sender_lookalike_max_distance: int
     sender_min_domain_age_days: int
     check_phases: tuple[tuple[str, ...], ...]
+    check_phases_internal: tuple[tuple[str, ...], ...]
+    external_warning_text: str
     auto_rewrite: bool
     loop_guard_secret: str
     rewrite_only_from: tuple[str, ...]
@@ -165,11 +183,23 @@ def load_config(path: str | Path = "config.toml") -> Config:
             raw.get("defang_on_macro", "all"),
             "defang_on_macro",
         ),
+        defang_on_external=_action(
+            raw.get("defang_on_external", "no"),
+            "defang_on_external",
+        ),
         sender_lookalike_max_distance=int(raw.get("sender_lookalike_max_distance", 2)),
         sender_min_domain_age_days=int(
             raw.get("sender_min_domain_age_days", 365)
         ),
         check_phases=_check_phases(raw.get("check_phases")),
+        check_phases_internal=_check_phases(
+            raw.get("check_phases_internal"),
+            field="check_phases_internal",
+            default=_DEFAULT_CHECK_PHASES_INTERNAL,
+        ),
+        external_warning_text=str(
+            raw.get("external_warning_text", _DEFAULT_EXTERNAL_WARNING_TEXT)
+        ),
         auto_rewrite=_bool(raw.get("auto_rewrite", False), "auto_rewrite"),
         loop_guard_secret=_loop_guard_secret(
             raw.get("loop_guard_secret", ""),

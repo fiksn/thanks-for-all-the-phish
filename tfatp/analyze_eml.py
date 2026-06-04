@@ -21,7 +21,7 @@ from email.message import EmailMessage
 
 from tfatp import loop_guard
 from tfatp.attachments import scan as scan_attachments
-from tfatp.config import _DEFAULT_CHECK_PHASES
+from tfatp.config import _DEFAULT_CHECK_PHASES, _DEFAULT_CHECK_PHASES_INTERNAL
 from tfatp.dkim_verify import verify as verify_dkim
 from tfatp.link_analysis import (
     DEFAULT_YOUNG_DOMAIN_DAYS,
@@ -59,6 +59,28 @@ def _read_input(path: str | None) -> bytes:
         with open(path, "rb") as f:
             return f.read()
     return sys.stdin.buffer.read()
+
+
+def _yellow_banner_html(text: str) -> str:
+    import html as _html
+    return (
+        '<div style="border:2px solid #b58900; background:#fffbe6; padding:12px; '
+        'margin:0 0 16px 0; font-family:Roboto,Arial,Helvetica,sans-serif; '
+        'font-size:14px; color:#5a4a00;">'
+        f'<div style="font-weight:bold;">{_html.escape(text)}</div></div>'
+    )
+
+
+def _yellow_banner_text(text: str) -> str:
+    # Mirror the plain-text shape of the analysis banner so a text-mode reader
+    # sees a clearly bracketed block, just with a different label.
+    return (
+        "=== external-sender warning ===\n"
+        f"{text}\n"
+        "=== end warning ===\n"
+        "\n"
+        "\n"
+    )
 
 
 def _banner_lines(
@@ -100,6 +122,8 @@ def _banner(
     neutralize_all: bool = False,
 ) -> str:
     top, warnings = _banner_lines(smtp_result, sender_lookalike, findings, neutralize_all)
+    if not top and not warnings:
+        return ""
     lines = ["=== thanks-for-all-the-phish analysis ==="]
     lines.extend(top)
     if warnings:
@@ -121,6 +145,8 @@ def _banner_html(
 ) -> str:
     import html as _html
     top, warnings = _banner_lines(smtp_result, sender_lookalike, findings, neutralize_all)
+    if not top and not warnings:
+        return ""
     parts = [
         '<div style="border:2px solid #c00; background:#fff5f5; padding:12px; '
         'margin:0 0 16px 0; font-family:Roboto,Arial,Helvetica,sans-serif; '
@@ -150,6 +176,7 @@ def build_corrected_eml(
     neutralize_all: bool = False,
     loop_guard_secret: str = "",
     body_subtype: str = "plain",
+    external_warning_text: str = "",
 ) -> bytes:
     # DKIM is deliberately not propagated into the rewritten message — the
     # signature applies to the original (attached) bytes; recomputing it on
@@ -178,11 +205,15 @@ def build_corrected_eml(
         new_msg["X-Checked-Findings"] = suspect_summary
 
     if body_subtype == "html":
-        banner = _banner_html(smtp_result, sender_lookalike, findings, neutralize_all)
-        new_msg.set_content(banner + annotated_body, subtype="html")
+        yellow = _yellow_banner_html(external_warning_text) if external_warning_text else ""
+        red = _banner_html(smtp_result, sender_lookalike, findings, neutralize_all)
+        new_msg.set_content(yellow + red + annotated_body, subtype="html")
     else:
-        banner = _banner(smtp_result, sender_lookalike, findings, neutralize_all)
-        new_msg.set_content(banner + annotated_body)
+        yellow = _yellow_banner_text(external_warning_text) if external_warning_text else ""
+        red = _banner(smtp_result, sender_lookalike, findings, neutralize_all)
+        new_msg.set_content(yellow + red + annotated_body)
+    if external_warning_text:
+        new_msg["X-Checked-External-Sender"] = "yes"
 
     # Attach the original message as a real message/rfc822 part so any reader
     # can recover the unmodified bytes.
@@ -237,6 +268,8 @@ def analyze_with_gate(
     sender_lookalike_max_distance: int,
     sender_min_domain_age_days: int,
     check_phases: tuple[tuple[str, ...], ...] | None = None,
+    check_phases_internal: tuple[tuple[str, ...], ...] | None = None,
+    org_domains: frozenset[str] = frozenset(),
 ) -> tuple[
     list[LinkFinding],
     SmtpVerifyResult | None,
@@ -244,16 +277,31 @@ def analyze_with_gate(
     str | None,
     dict[str, bool],
     bool,
+    bool,
 ]:
     """Run the phased gate over `raw` and return collected signals.
 
     Phases run in order; the first phase to surface a suspicious signal blocks
     every later phase. SMTP probe and link-fetching never execute past a
-    failed phase. Returns:
+    failed phase. The `external_warning` stage is informational — when the
+    sender is external and the stage runs, the caller is told to render the
+    yellow banner; it never gates later phases.
+
+    When `org_domains` is non-empty, the sender is classified as internal
+    (sender domain ∈ org_domains) or external; the matching phase list is
+    used. With an empty `org_domains`, classification is disabled and the
+    external phases are always applied.
+
+    Returns:
       (findings, smtp_result, sender_lookalike, sender_age_warning,
-       enabled_link_stages, gate_failed).
+       enabled_link_stages, gate_failed, external_warning_triggered).
     """
-    phases = check_phases if check_phases is not None else _DEFAULT_CHECK_PHASES
+    external_phases = check_phases if check_phases is not None else _DEFAULT_CHECK_PHASES
+    internal_phases = (
+        check_phases_internal
+        if check_phases_internal is not None
+        else _DEFAULT_CHECK_PHASES_INTERNAL
+    )
     body = message_body_text(raw)
     original = email.message_from_bytes(raw, policy=policy.default)
     sender_addr = extract_address(str(original.get("From", "")))
@@ -263,6 +311,10 @@ def analyze_with_gate(
     protected_domain = (
         registrable_domain(mail_from.split("@", 1)[1]) if "@" in mail_from else ""
     )
+    is_internal = bool(org_domains) and sender_domain in org_domains
+    is_external = bool(org_domains) and not is_internal and bool(sender_domain)
+    phases = internal_phases if is_internal else external_phases
+    external_warning_triggered = False
 
     smtp_result: SmtpVerifyResult | None = None
     sender_lookalike: LookalikeResult | None = None
@@ -307,6 +359,9 @@ def analyze_with_gate(
                     )
                     if not smtp_result.ok:
                         phase_failed = True
+            elif stage == "external_warning":
+                if is_external:
+                    external_warning_triggered = True
             elif stage in enabled:
                 enabled[stage] = True
         if phase_failed:
@@ -393,7 +448,10 @@ def analyze_with_gate(
                 warnings=[sender_age_warning],
             )
         )
-    return findings, smtp_result, sender_lookalike, sender_age_warning, enabled, gate_failed
+    return (
+        findings, smtp_result, sender_lookalike, sender_age_warning,
+        enabled, gate_failed, external_warning_triggered,
+    )
 
 
 def run(raw: bytes, young_domain_days: int, quiet: bool,
@@ -402,6 +460,9 @@ def run(raw: bytes, young_domain_days: int, quiet: bool,
         sender_lookalike_max_distance: int = 2,
         sender_min_domain_age_days: int = 365,
         check_phases: tuple[tuple[str, ...], ...] | None = None,
+        check_phases_internal: tuple[tuple[str, ...], ...] | None = None,
+        org_domains: frozenset[str] = frozenset(),
+        external_warning_text: str = "",
         loop_guard_secret: str = "") -> int:
     defang_policy = defang_policy or DefangPolicy()
     phases = check_phases if check_phases is not None else _DEFAULT_CHECK_PHASES
@@ -419,6 +480,7 @@ def run(raw: bytes, young_domain_days: int, quiet: bool,
         sender_age_warning,
         enabled,
         gate_failed,
+        external_warning_triggered,
     ) = analyze_with_gate(
         raw,
         mail_from=mail_from,
@@ -428,10 +490,13 @@ def run(raw: bytes, young_domain_days: int, quiet: bool,
         sender_lookalike_max_distance=sender_lookalike_max_distance,
         sender_min_domain_age_days=sender_min_domain_age_days,
         check_phases=phases,
+        check_phases_internal=check_phases_internal,
+        org_domains=org_domains,
     )
 
     neutralize_all, per_url = compute_defang(
-        findings, smtp_result, sender_lookalike, defang_policy
+        findings, smtp_result, sender_lookalike, defang_policy,
+        external_warning=external_warning_triggered,
     )
     annotated = rewrite_body(body, body_subtype, findings, neutralize_all, per_url)
 
@@ -480,14 +545,17 @@ def run(raw: bytes, young_domain_days: int, quiet: bool,
         else:
             print("  links   : (none)", file=sys.stderr)
 
+    yellow_text = external_warning_text if external_warning_triggered else ""
     corrected = build_corrected_eml(
         raw, annotated, findings, smtp_result, sender_lookalike, neutralize_all,
         loop_guard_secret=loop_guard_secret,
         body_subtype=body_subtype,
+        external_warning_text=yellow_text,
     )
     sys.stdout.buffer.write(corrected)
 
     # DKIM intentionally excluded from the suspicious decision — see _banner().
+    # The yellow banner alone is NOT a "suspicious" signal — it's informational.
     suspicious = (
         any(f.warnings for f in findings)
         or (smtp_result is not None and smtp_result.status == "rejected")
@@ -537,6 +605,20 @@ def main(argv: list[str]) -> int:
         "counts as too young (default: 365).",
     )
     p.add_argument(
+        "--org-domain",
+        action="append",
+        default=[],
+        help="Domain to treat as internal (workspace-owned). May be repeated. "
+        "When set, the sender is classified internal/external and the matching "
+        "phase list applies. Without it, classification is disabled.",
+    )
+    p.add_argument(
+        "--external-warning-text",
+        default="",
+        help="If non-empty, render this yellow banner above the analysis "
+        "banner whenever the external_warning stage fires.",
+    )
+    p.add_argument(
         "--loop-guard-secret",
         default="",
         help="HMAC key for X-Checked-Mac. If set, the rewritten .eml carries "
@@ -562,6 +644,8 @@ def main(argv: list[str]) -> int:
         do_smtp_verify=args.smtp_verify,
         sender_lookalike_max_distance=args.sender_lookalike_distance,
         sender_min_domain_age_days=args.sender_min_domain_age_days,
+        org_domains=frozenset(d.lower() for d in args.org_domain if d),
+        external_warning_text=args.external_warning_text,
         loop_guard_secret=args.loop_guard_secret,
     )
 

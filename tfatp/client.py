@@ -35,8 +35,9 @@ class GmailClient:
     def __init__(self, cfg: Config, subject: str | None = None) -> None:
         self._cfg = cfg
         self._user_id = subject or cfg.user
-        creds = get_credentials(cfg, subject=self._user_id)
-        self._service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        self._creds = get_credentials(cfg, subject=self._user_id)
+        self._service = build("gmail", "v1", credentials=self._creds, cache_discovery=False)
+        self._org_domains: frozenset[str] | None = None
 
     @classmethod
     def for_user(cls, cfg: Config, user: str) -> "GmailClient":
@@ -54,6 +55,19 @@ class GmailClient:
     @property
     def config(self) -> Config:
         return self._cfg
+
+    @property
+    def org_domains(self) -> frozenset[str]:
+        """Resolved set of workspace-owned domains, cached per-client.
+
+        Used to classify a sender as internal vs external. Empty set means
+        classification could not be resolved (no admin_user for DWD, userinfo
+        offline for OAuth) — callers should treat that as 'disabled'.
+        """
+        if self._org_domains is None:
+            from tfatp.org_domains import resolve as _resolve
+            self._org_domains = _resolve(self._cfg, self._creds)
+        return self._org_domains
 
     def list_message_ids(self, query: str = "", max_results: int = 10) -> list[str]:
         resp = (

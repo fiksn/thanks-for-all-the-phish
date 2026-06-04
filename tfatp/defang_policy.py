@@ -39,6 +39,7 @@ class DefangPolicy:
     on_link_lookalike: Action = "all"
     on_anchor_deception: Action = "yes"
     on_macro: Action = "all"
+    on_external_warning: Action = "no"
 
     def __post_init__(self) -> None:
         # Canonicalize every field so callers can compare against literal
@@ -77,6 +78,8 @@ def compute(
     smtp_result: SmtpVerifyResult | None,
     sender_lookalike: LookalikeResult | None,
     policy: DefangPolicy,
+    *,
+    external_warning: bool = False,
 ) -> tuple[bool, set[str]]:
     """Return (neutralize_all, per_url_to_defang).
 
@@ -92,6 +95,11 @@ def compute(
         policy.on_sender_lookalike in ("yes", "all")
         and sender_lookalike is not None
         and sender_lookalike.matched
+    ) or (
+        # External-sender warning has no specific URL — both "yes" and "all"
+        # behave like "all" (whole body defanged), same as on_smtp_fail.
+        policy.on_external_warning in ("yes", "all")
+        and external_warning
     )
     per_url: set[str] = set()
     for f in findings:

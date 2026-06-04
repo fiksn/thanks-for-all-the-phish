@@ -101,10 +101,35 @@ def test_corrected_html_banner_lists_defanged_urls_when_neutralize_all():
 
 def test_corrected_html_banner_uses_html_styling():
     raw = _html_eml('<p>hi</p>')
-    corrected = build_corrected_eml(raw, "<p>hi</p>", [], body_subtype="html")
+    finding = LinkFinding(
+        url="https://bad.example/x", host="bad.example", domain="bad.example",
+        age_days=1, has_password_form=True,
+        warnings=["password form detected"],
+    )
+    corrected = build_corrected_eml(raw, "<p>hi</p>", [finding], body_subtype="html")
     body = _decoded_html(corrected)
     assert "border:2px solid #c00" in body  # styled banner
     assert "thanks-for-all-the-phish analysis" in body
+
+
+def test_corrected_html_banner_suppressed_when_no_findings():
+    raw = _html_eml('<p>hi</p>')
+    corrected = build_corrected_eml(raw, "<p>hi</p>", [], body_subtype="html")
+    body = _decoded_html(corrected)
+    assert "thanks-for-all-the-phish analysis" not in body
+
+
+def test_yellow_banner_renders_when_external_warning_text_set():
+    raw = _html_eml('<p>hi</p>')
+    corrected = build_corrected_eml(
+        raw, "<p>hi</p>", [], body_subtype="html",
+        external_warning_text="Sender is external.",
+    )
+    body = _decoded_html(corrected)
+    assert "Sender is external." in body
+    assert "#b58900" in body  # yellow border
+    # No analysis banner when nothing else fired.
+    assert "thanks-for-all-the-phish analysis" not in body
 
 
 # --- tracking-pixel neutralization ------------------------------------------

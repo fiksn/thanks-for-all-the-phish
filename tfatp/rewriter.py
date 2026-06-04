@@ -54,17 +54,21 @@ def maybe_rewrite_new_mail(
     # HELO advertises a host on our side: use the domain of the recipient
     # mailbox we just received the message at, not the workspace-config knob.
     helo = client.user.split("@", 1)[1] if "@" in client.user else "localhost"
-    findings, smtp_result, sender_lookalike, _sender_age_warning, _enabled, _gate_failed = (
-        analyze_with_gate(
-            raw,
-            mail_from=client.user,
-            helo_domain=helo,
-            do_smtp_verify=cfg.smtp_verify,
-            young_domain_days=cfg.young_domain_days,
-            sender_lookalike_max_distance=cfg.sender_lookalike_max_distance,
-            sender_min_domain_age_days=cfg.sender_min_domain_age_days,
-            check_phases=cfg.check_phases,
-        )
+    org_domains = client.org_domains
+    (
+        findings, smtp_result, sender_lookalike, _sender_age_warning,
+        _enabled, _gate_failed, external_warning_triggered,
+    ) = analyze_with_gate(
+        raw,
+        mail_from=client.user,
+        helo_domain=helo,
+        do_smtp_verify=cfg.smtp_verify,
+        young_domain_days=cfg.young_domain_days,
+        sender_lookalike_max_distance=cfg.sender_lookalike_max_distance,
+        sender_min_domain_age_days=cfg.sender_min_domain_age_days,
+        check_phases=cfg.check_phases,
+        check_phases_internal=cfg.check_phases_internal,
+        org_domains=org_domains,
     )
 
     suspicious = (
@@ -72,8 +76,10 @@ def maybe_rewrite_new_mail(
         or (smtp_result is not None and smtp_result.status == "rejected")
         or (sender_lookalike is not None and sender_lookalike.matched)
     )
-
-    if not suspicious:
+    # External-sender warning is a legitimate reason to rewrite even when no
+    # other check fired — otherwise a clean external mail never picks up the
+    # yellow banner because the rewrite gate is closed.
+    if not suspicious and not external_warning_triggered:
         return False, findings, None
     if not cfg.auto_rewrite:
         print(f"{log_prefix} suspicious but auto_rewrite=false; skipping", file=sys.stderr)
@@ -95,18 +101,22 @@ def maybe_rewrite_new_mail(
         on_link_lookalike=cfg.defang_on_link_lookalike,
         on_anchor_deception=cfg.defang_on_anchor_deception,
         on_macro=cfg.defang_on_macro,
+        on_external_warning=cfg.defang_on_external,
     )
     neutralize_all, per_url = compute_defang(
         findings,
         smtp_result,
         sender_lookalike,
         defang_policy,
+        external_warning=external_warning_triggered,
     )
     annotated = rewrite_body(body, body_subtype, findings, neutralize_all, per_url)
+    yellow_text = cfg.external_warning_text if external_warning_triggered else ""
     new_raw = build_corrected_eml(
         raw, annotated, findings, smtp_result, sender_lookalike, neutralize_all,
         loop_guard_secret=cfg.loop_guard_secret,
         body_subtype=body_subtype,
+        external_warning_text=yellow_text,
     )
 
     print(
