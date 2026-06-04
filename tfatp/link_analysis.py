@@ -15,6 +15,7 @@ import drawbridge.sync
 import httpx
 import tldextract
 from bs4 import BeautifulSoup, NavigableString
+from bs4.builder import ParserRejectedMarkup
 
 _LINK_RE = re.compile(
     r"(?i)\b((?:https?|ftps?|sftp)://[^\s<>\"'\)\]]+)",
@@ -102,10 +103,17 @@ def _parse_html(content: str | bytes) -> BeautifulSoup:
     handles those gracefully.
     """
     if isinstance(content, str):
-        encoded = content.encode("utf-8", errors="replace")
-        truncated = encoded[:_MAX_HTML_PARSE_BYTES]
-        return BeautifulSoup(truncated.decode("utf-8", errors="replace"), "html.parser")
-    return BeautifulSoup(content[:_MAX_HTML_PARSE_BYTES], "html.parser")
+        encoded = content.encode("utf-8", errors="ignore")
+        truncated = encoded[:_MAX_HTML_PARSE_BYTES].decode("utf-8", errors="ignore")
+    else:
+        truncated = content[:_MAX_HTML_PARSE_BYTES].decode("utf-8", errors="ignore")
+    try:
+        return BeautifulSoup(truncated, "html.parser")
+    except ParserRejectedMarkup:
+        # Malformed CDATA/marked sections in some senders' HTML crash html.parser
+        # outright. Treat the body as empty rather than aborting the whole
+        # pipeline — link extraction from the plain-text fallback still runs.
+        return BeautifulSoup("", "html.parser")
 
 
 def extract_links(text: str) -> list[str]:
@@ -377,32 +385,69 @@ def analyze(
       "not resolved" warning instead.
     """
     findings: list[LinkFinding] = []
+    seen_urls: set[str] = set()
     for url in extract_links(text):
-        host = urlparse(url).hostname or ""
-        domain = registrable_domain(host) if host else ""
-        age = domain_age_days(domain) if (domain and check_link_domain_age) else None
-        pwd = has_password_form(url) if check_password_form else False
-        warnings: list[str] = []
-        if check_link_domain_age and domain:
-            if age is None:
-                warnings.append(f"young domain - age unknown for {domain} (treated as too young)")
-            elif age < young_domain_days:
-                warnings.append(f"young domain - {age}d")
-        if pwd:
-            warnings.append("form contains password input field")
-        if check_password_form:
-            redirect_warning = _redirector_warning(url, host, domain)
-            if redirect_warning:
-                warnings.append(redirect_warning)
-        elif _is_known_redirector(host, domain):
-            warnings.append("redirector/tracking URL (not resolved — link fetch gated off)")
-        findings.append(LinkFinding(url, host, domain, age, pwd, warnings))
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        findings.append(_link_finding(
+            url, young_domain_days=young_domain_days,
+            check_link_domain_age=check_link_domain_age,
+            check_password_form=check_password_form,
+        ))
     if raw_rfc822 is not None:
+        subject = ""
+        try:
+            subject = str(email.message_from_bytes(raw_rfc822, policy=policy.default)
+                          .get("Subject", "") or "")
+        except Exception:  # noqa: BLE001
+            subject = ""
+        for url in extract_links(subject):
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            f = _link_finding(
+                url, young_domain_days=young_domain_days,
+                check_link_domain_age=check_link_domain_age,
+                check_password_form=check_password_form,
+            )
+            # Surface origin so the analysis banner makes it clear the URL came
+            # from a place a recipient would not normally expect to see one.
+            f.warnings.insert(0, "URL appears in Subject header")
+            findings.append(f)
         _attach_anchor_deception_warnings(
             findings, raw_rfc822, resolve_redirectors=check_password_form
         )
         _attach_message_warnings(findings, raw_rfc822, text)
     return findings
+
+
+def _link_finding(
+    url: str,
+    *,
+    young_domain_days: int,
+    check_link_domain_age: bool,
+    check_password_form: bool,
+) -> LinkFinding:
+    host = urlparse(url).hostname or ""
+    domain = registrable_domain(host) if host else ""
+    age = domain_age_days(domain) if (domain and check_link_domain_age) else None
+    pwd = has_password_form(url) if check_password_form else False
+    warnings: list[str] = []
+    if check_link_domain_age and domain:
+        if age is None:
+            warnings.append(f"young domain - age unknown for {domain} (treated as too young)")
+        elif age < young_domain_days:
+            warnings.append(f"young domain - {age}d")
+    if pwd:
+        warnings.append("form contains password input field")
+    if check_password_form:
+        redirect_warning = _redirector_warning(url, host, domain)
+        if redirect_warning:
+            warnings.append(redirect_warning)
+    elif _is_known_redirector(host, domain):
+        warnings.append("redirector/tracking URL (not resolved — link fetch gated off)")
+    return LinkFinding(url, host, domain, age, pwd, warnings)
 
 
 def _attach_message_warnings(

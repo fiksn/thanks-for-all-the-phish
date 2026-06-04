@@ -10,8 +10,8 @@ Strategy:
    to the polling loop.
 
 For each new message we print a one-line summary and call
-`maybe_rewrite_new_mail`, which is itself gated by config.auto_rewrite and
-config.rewrite_only_from.
+`maybe_rewrite_new_mail`, which is itself gated by config.rewrite_only_from
+(empty list disables rewriting; [".*"] enables it for every sender).
 """
 
 import argparse

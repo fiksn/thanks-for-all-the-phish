@@ -5,8 +5,9 @@ Two paths:
   `cfg.admin_user`. Returns every verified domain + alias the workspace owns.
   Scope required: `admin.directory.domain.readonly`.
 - oauth: call the OpenID Connect userinfo endpoint and read `hd` (hosted
-  domain). Always union with the email-domain of `cfg.user` as a fallback so
-  a missing/blocked userinfo response still yields the obvious case.
+  domain). Always union with the email-domain of `cfg.user` and `cfg.domain`
+  as a fallback so a missing/blocked userinfo response still yields the
+  obvious cases.
 
 Domains are returned lowercase. An empty set means "classification disabled" —
 callers should treat every sender as neither internal nor external in that
@@ -35,16 +36,20 @@ def _email_domain(addr: str) -> str:
     return addr.split("@", 1)[1].lower() if "@" in addr else ""
 
 
+def _fallback(cfg: Config) -> frozenset[str]:
+    return frozenset(d for d in (_email_domain(cfg.user), cfg.domain.lower()) if d)
+
+
 def resolve(cfg: Config, creds: Credentials | None = None) -> frozenset[str]:
     if cfg.auth_mode == "service_account":
         return _resolve_dwd(cfg)
     if creds is None:
-        return frozenset(d for d in (_email_domain(cfg.user),) if d)
+        return _fallback(cfg)
     return _resolve_oauth(cfg, creds)
 
 
 def _resolve_dwd(cfg: Config) -> frozenset[str]:
-    fallback = frozenset(d for d in (_email_domain(cfg.user), cfg.domain.lower()) if d)
+    fallback = _fallback(cfg)
     if not cfg.admin_user:
         return fallback
     try:
@@ -67,10 +72,7 @@ def _resolve_dwd(cfg: Config) -> frozenset[str]:
 
 
 def _resolve_oauth(cfg: Config, creds: Credentials) -> frozenset[str]:
-    out: set[str] = set()
-    fallback = _email_domain(cfg.user)
-    if fallback:
-        out.add(fallback)
+    out: set[str] = set(_fallback(cfg))
     try:
         token = fresh_access_token(creds)
         req = urllib.request.Request(

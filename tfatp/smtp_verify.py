@@ -26,7 +26,13 @@ from dns import resolver as dns_resolver
 from dns.exception import DNSException
 
 SMTP_PORTS = (587, 25)
-DEFAULT_TIMEOUT = 8.0
+# Per-SMTP-operation timeout (connect + each command). Probes that block at the
+# TCP layer (firewall blackholes) cap out here.
+DEFAULT_TIMEOUT = 4.0
+# DNS lookups (MX, A) have their own lifetime independent of the SMTP timeout.
+# Resolver default is ~30s, which dominates total runtime when networks blackhole
+# UDP/53 — cap it tight so the gate doesn't stall.
+DNS_LIFETIME = 3.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,15 +45,23 @@ class SmtpVerifyResult:
         return self.status == "pass"
 
 
+def _resolver() -> dns_resolver.Resolver:
+    r = dns_resolver.Resolver()
+    r.lifetime = DNS_LIFETIME
+    r.timeout = DNS_LIFETIME
+    return r
+
+
 def _mx_hosts(domain: str) -> list[str]:
+    r = _resolver()
     try:
-        answers = dns_resolver.resolve(domain, "MX")
-        return [str(r.exchange).rstrip(".") for r in sorted(answers, key=lambda r: r.preference)]
+        answers = r.resolve(domain, "MX")
+        return [str(rr.exchange).rstrip(".") for rr in sorted(answers, key=lambda x: x.preference)]
     except DNSException:
         pass
     # RFC 5321: if no MX, fall back to the implicit A record.
     try:
-        dns_resolver.resolve(domain, "A")
+        r.resolve(domain, "A")
         return [domain]
     except DNSException:
         return []
@@ -92,14 +106,17 @@ def _decode(b: bytes | str) -> str:
 
 
 def _host_has_only_public_addresses(host: str) -> tuple[bool, str]:
-    try:
-        addrinfos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-    except OSError as exc:
-        return False, f"{host} DNS resolution failed {exc!r}"
-    if not addrinfos:
+    r = _resolver()
+    raw_ips: list[str] = []
+    for qtype in ("A", "AAAA"):
+        try:
+            answers = r.resolve(host, qtype)
+        except DNSException:
+            continue
+        raw_ips.extend(str(rr) for rr in answers)
+    if not raw_ips:
         return False, f"{host} DNS resolution returned no addresses"
-    for addrinfo in addrinfos:
-        raw_ip = addrinfo[4][0]
+    for raw_ip in raw_ips:
         ip = ip_address(raw_ip)
         mapped = getattr(ip, "ipv4_mapped", None)
         if mapped is not None:
@@ -164,3 +181,34 @@ def verify_sender(from_address: str, mail_from: str, helo_domain: str,
 
 verify_sender.cache_info = _verify_cached.cache_info  # type: ignore[attr-defined]
 verify_sender.cache_clear = _verify_cached.cache_clear  # type: ignore[attr-defined]
+
+
+# Hosts to probe for outbound SMTP reachability at startup. Both are public
+# Google endpoints — any environment that can do SMTP callouts will reach at
+# least one of them on at least one of the configured SMTP_PORTS.
+_CONNECTIVITY_HOSTS = ("aspmx.l.google.com", "smtp.gmail.com")
+_CONNECTIVITY_TIMEOUT = 3.0
+
+
+def can_smtp_callout() -> tuple[set[int], str]:
+    """Probe known-good MX/submission hosts to see which SMTP ports are open.
+
+    Returns (reachable_ports, detail). An empty set means every probe failed —
+    the network blocks outbound SMTP entirely (residential ISPs and most cloud
+    providers block 25 by default; some also restrict 587). When 25 is
+    unreachable, smtp_verify will time out on every real probe, so callers
+    should disable it rather than eat the per-MX timeout on each message.
+    """
+    reachable: set[int] = set()
+    details: list[str] = []
+    for host in _CONNECTIVITY_HOSTS:
+        for port in SMTP_PORTS:
+            if port in reachable:
+                continue
+            try:
+                with socket.create_connection((host, port), timeout=_CONNECTIVITY_TIMEOUT):
+                    reachable.add(port)
+                    details.append(f"{host}:{port} ok")
+            except OSError as exc:
+                details.append(f"{host}:{port} {exc!r}")
+    return reachable, "; ".join(details)

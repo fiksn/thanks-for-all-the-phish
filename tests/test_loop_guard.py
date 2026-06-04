@@ -72,19 +72,19 @@ def test_is_own_rewrite_fails_closed_on_empty_secret():
     assert not loop_guard.is_own_rewrite(parsed, "")
 
 
-def test_config_requires_secret_when_auto_rewrite_true(tmp_path):
+def test_config_requires_secret_when_rewrite_only_from_set(tmp_path):
     p = tmp_path / "c.toml"
     p.write_text(
-        'domain="x"\nuser="a@x"\nauto_rewrite=true\nloop_guard_secret=""\n'
+        'domain="x"\nuser="a@x"\nrewrite_only_from=[".*"]\nloop_guard_secret=""\n'
     )
     with pytest.raises(ValueError, match="loop_guard_secret"):
         load_config(p)
 
 
-def test_config_accepts_short_secret_when_auto_rewrite_off(tmp_path):
+def test_config_accepts_short_secret_when_rewrite_only_from_empty(tmp_path):
     p = tmp_path / "c.toml"
     p.write_text(
-        'domain="x"\nuser="a@x"\nauto_rewrite=false\nloop_guard_secret=""\n'
+        'domain="x"\nuser="a@x"\nrewrite_only_from=[]\nloop_guard_secret=""\n'
     )
     cfg = load_config(p)
     assert cfg.loop_guard_secret == ""

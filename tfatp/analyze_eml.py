@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import email
+import re
 import sys
 from email import policy
 from email.message import EmailMessage
@@ -46,6 +47,14 @@ X_CHECKED_BY = loop_guard.X_CHECKED_BY
 # Content-Type, Content-Transfer-Encoding, etc. must be rewritten because the
 # body changes; everything else (From/To/Subject/Date/Message-ID/References/...)
 # is preserved verbatim so threading and identity stay intact.
+def _defang_subject_urls(subject: str) -> str:
+    from tfatp.link_analysis import defang, extract_links
+    out = subject
+    for url in extract_links(subject):
+        out = out.replace(url, defang(url))
+    return out
+
+
 _HEADERS_TO_REWRITE = {
     "content-type",
     "content-transfer-encoding",
@@ -59,28 +68,6 @@ def _read_input(path: str | None) -> bytes:
         with open(path, "rb") as f:
             return f.read()
     return sys.stdin.buffer.read()
-
-
-def _yellow_banner_html(text: str) -> str:
-    import html as _html
-    return (
-        '<div style="border:2px solid #b58900; background:#fffbe6; padding:12px; '
-        'margin:0 0 16px 0; font-family:Roboto,Arial,Helvetica,sans-serif; '
-        'font-size:14px; color:#5a4a00;">'
-        f'<div style="font-weight:bold;">{_html.escape(text)}</div></div>'
-    )
-
-
-def _yellow_banner_text(text: str) -> str:
-    # Mirror the plain-text shape of the analysis banner so a text-mode reader
-    # sees a clearly bracketed block, just with a different label.
-    return (
-        "=== external-sender warning ===\n"
-        f"{text}\n"
-        "=== end warning ===\n"
-        "\n"
-        "\n"
-    )
 
 
 def _banner_lines(
@@ -177,6 +164,7 @@ def build_corrected_eml(
     loop_guard_secret: str = "",
     body_subtype: str = "plain",
     external_warning_text: str = "",
+    external_warning_html: str = "",
 ) -> bytes:
     # DKIM is deliberately not propagated into the rewritten message — the
     # signature applies to the original (attached) bytes; recomputing it on
@@ -186,8 +174,13 @@ def build_corrected_eml(
 
     new_msg = EmailMessage(policy=policy.SMTP)
     for k, v in original.items():
-        if k.lower() not in _HEADERS_TO_REWRITE:
-            new_msg[k] = v
+        if k.lower() in _HEADERS_TO_REWRITE:
+            continue
+        if k.lower() == "subject":
+            # Defang any URL that appears in the Subject so a recipient client
+            # that auto-linkifies subject text can't follow it directly.
+            v = _defang_subject_urls(str(v))
+        new_msg[k] = v
 
     new_msg[loop_guard.HEADER_CHECKED_BY] = X_CHECKED_BY
     if loop_guard_secret:
@@ -204,15 +197,16 @@ def build_corrected_eml(
     if suspect_summary:
         new_msg["X-Checked-Findings"] = suspect_summary
 
+    external_triggered = bool(external_warning_text or external_warning_html)
     if body_subtype == "html":
-        yellow = _yellow_banner_html(external_warning_text) if external_warning_text else ""
-        red = _banner_html(smtp_result, sender_lookalike, findings, neutralize_all)
-        new_msg.set_content(yellow + red + annotated_body, subtype="html")
+        intro = external_warning_html or ""
+        analysis_banner = _banner_html(smtp_result, sender_lookalike, findings, neutralize_all)
+        new_msg.set_content(intro + analysis_banner + annotated_body, subtype="html")
     else:
-        yellow = _yellow_banner_text(external_warning_text) if external_warning_text else ""
-        red = _banner(smtp_result, sender_lookalike, findings, neutralize_all)
-        new_msg.set_content(yellow + red + annotated_body)
-    if external_warning_text:
+        intro = f"{external_warning_text}\n\n" if external_warning_text else ""
+        analysis_banner = _banner(smtp_result, sender_lookalike, findings, neutralize_all)
+        new_msg.set_content(intro + analysis_banner + annotated_body)
+    if external_triggered:
         new_msg["X-Checked-External-Sender"] = "yes"
 
     # Attach the original message as a real message/rfc822 part so any reader
@@ -270,6 +264,7 @@ def analyze_with_gate(
     check_phases: tuple[tuple[str, ...], ...] | None = None,
     check_phases_internal: tuple[tuple[str, ...], ...] | None = None,
     org_domains: frozenset[str] = frozenset(),
+    sender_whitelist: tuple[str, ...] = (),
 ) -> tuple[
     list[LinkFinding],
     SmtpVerifyResult | None,
@@ -305,8 +300,11 @@ def analyze_with_gate(
     body = message_body_text(raw)
     original = email.message_from_bytes(raw, policy=policy.default)
     sender_addr = extract_address(str(original.get("From", "")))
-    sender_domain = (
-        registrable_domain(sender_addr.split("@", 1)[1]) if "@" in sender_addr else ""
+    sender_host = sender_addr.split("@", 1)[1].lower() if "@" in sender_addr else ""
+    sender_domain = registrable_domain(sender_host) if sender_host else ""
+    sender_whitelisted = (
+        bool(sender_host)
+        and any(re.fullmatch(pat, sender_host) for pat in sender_whitelist)
     )
     protected_domain = (
         registrable_domain(mail_from.split("@", 1)[1]) if "@" in mail_from else ""
@@ -331,7 +329,7 @@ def analyze_with_gate(
             break
         phase_failed = False
         for stage in phase:
-            if stage == "sender_domain_age" and sender_domain:
+            if stage == "sender_domain_age" and sender_domain and not sender_whitelisted:
                 age = domain_age_days(sender_domain)
                 if age is None:
                     sender_age_warning = (
@@ -345,15 +343,37 @@ def analyze_with_gate(
                         f"for {sender_domain}"
                     )
                     phase_failed = True
-            elif stage == "sender_lookalike" and sender_domain and protected_domain:
-                sender_lookalike = check_lookalike(
-                    sender_domain, protected_domain,
-                    max_distance=sender_lookalike_max_distance,
+            elif (
+                stage == "sender_lookalike"
+                and sender_domain
+                and not sender_whitelisted
+            ):
+                targets = {d for d in org_domains if d} | (
+                    {protected_domain} if protected_domain else set()
                 )
-                if sender_lookalike.matched:
+                targets.discard(sender_domain)
+                best: LookalikeResult | None = None
+                for target in targets:
+                    res = check_lookalike(
+                        sender_domain, target,
+                        max_distance=sender_lookalike_max_distance,
+                    )
+                    if best is None or res.distance < best.distance:
+                        best = res
+                    if res.matched:
+                        break
+                sender_lookalike = best
+                if sender_lookalike is not None and sender_lookalike.matched:
                     phase_failed = True
             elif stage == "smtp_verify":
-                if do_smtp_verify and mail_from and sender_addr:
+                if do_smtp_verify and mail_from and sender_addr and not sender_whitelisted:
+                    from tfatp.smtp_verify import DEFAULT_TIMEOUT, DNS_LIFETIME, SMTP_PORTS
+                    worst_case = DNS_LIFETIME + len(SMTP_PORTS) * DEFAULT_TIMEOUT
+                    print(
+                        f"[analyze] probing SMTP for {sender_addr} "
+                        f"(worst case ~{worst_case:.0f}s per MX host)",
+                        file=sys.stderr,
+                    )
                     smtp_result = verify_sender(
                         sender_addr, mail_from, helo_domain or "localhost"
                     )
@@ -463,7 +483,9 @@ def run(raw: bytes, young_domain_days: int, quiet: bool,
         check_phases_internal: tuple[tuple[str, ...], ...] | None = None,
         org_domains: frozenset[str] = frozenset(),
         external_warning_text: str = "",
-        loop_guard_secret: str = "") -> int:
+        external_warning_html: str = "",
+        loop_guard_secret: str = "",
+        sender_whitelist: tuple[str, ...] = ()) -> int:
     defang_policy = defang_policy or DefangPolicy()
     phases = check_phases if check_phases is not None else _DEFAULT_CHECK_PHASES
     if not raw.strip():
@@ -492,6 +514,7 @@ def run(raw: bytes, young_domain_days: int, quiet: bool,
         check_phases=phases,
         check_phases_internal=check_phases_internal,
         org_domains=org_domains,
+        sender_whitelist=sender_whitelist,
     )
 
     neutralize_all, per_url = compute_defang(
@@ -509,8 +532,6 @@ def run(raw: bytes, young_domain_days: int, quiet: bool,
         print(f"  dkim    : {dkim_result.status} ({dkim_result.detail})", file=sys.stderr)
         if sender_age_warning:
             print(f"  sender-age: {sender_age_warning}", file=sys.stderr)
-        if smtp_result is not None:
-            print(f"  smtp    : {smtp_result.status} ({smtp_result.detail})", file=sys.stderr)
         if sender_lookalike is not None and sender_lookalike.matched:
             print(f"  lookalike: {sender_lookalike.detail}", file=sys.stderr)
         if gate_failed:
@@ -545,12 +566,14 @@ def run(raw: bytes, young_domain_days: int, quiet: bool,
         else:
             print("  links   : (none)", file=sys.stderr)
 
-    yellow_text = external_warning_text if external_warning_triggered else ""
+    intro_text = external_warning_text if external_warning_triggered else ""
+    intro_html = external_warning_html if external_warning_triggered else ""
     corrected = build_corrected_eml(
         raw, annotated, findings, smtp_result, sender_lookalike, neutralize_all,
         loop_guard_secret=loop_guard_secret,
         body_subtype=body_subtype,
-        external_warning_text=yellow_text,
+        external_warning_text=intro_text,
+        external_warning_html=intro_html,
     )
     sys.stdout.buffer.write(corrected)
 
@@ -619,6 +642,14 @@ def main(argv: list[str]) -> int:
         "banner whenever the external_warning stage fires.",
     )
     p.add_argument(
+        "--sender-whitelist",
+        action="append",
+        default=[],
+        help=r"Regex (e.g. '.*\.atlassian\.net') matched via re.fullmatch "
+        "against the lowercased From: host. Matching senders skip "
+        "sender_domain_age, sender_lookalike, and smtp_verify. May be repeated.",
+    )
+    p.add_argument(
         "--loop-guard-secret",
         default="",
         help="HMAC key for X-Checked-Mac. If set, the rewritten .eml carries "
@@ -647,6 +678,7 @@ def main(argv: list[str]) -> int:
         org_domains=frozenset(d.lower() for d in args.org_domain if d),
         external_warning_text=args.external_warning_text,
         loop_guard_secret=args.loop_guard_secret,
+        sender_whitelist=tuple(p.strip().lower() for p in args.sender_whitelist if p.strip()),
     )
 
 

@@ -1,3 +1,4 @@
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +31,20 @@ _DEFAULT_CHECK_PHASES_INTERNAL: tuple[tuple[str, ...], ...] = (
     ("check_password_form",),
 )
 _DEFAULT_EXTERNAL_WARNING_TEXT = "Sender is external to the organization, beware."
+_DEFAULT_EXTERNAL_WARNING_HTML = (
+    '<div style="border:2px solid #b58900; background:#fffbe6; padding:12px; '
+    'margin:0 0 16px 0; font-family:Roboto,Arial,Helvetica,sans-serif; '
+    'font-size:14px; color:#5a4a00;">'
+    '<div style="font-weight:bold;">'
+    "Sender is external to the organization, beware."
+    "</div></div>"
+)
+# Sender hosts matching any of these regexes (re.fullmatch) skip the
+# sender-side checks (sender_domain_age, sender_lookalike, smtp_verify).
+# Atlassian cloud tenants send from `*.atlassian.net` subdomains that are
+# young and lookalike-ish by construction, so they trip every sender
+# heuristic without being malicious.
+_DEFAULT_SENDER_WHITELIST: tuple[str, ...] = (r".*\.atlassian\.net",)
 _BOOL_STRINGS = {
     "true": True,
     "false": False,
@@ -74,22 +89,63 @@ def _check_phases(
     return tuple(phases)
 
 
-def _loop_guard_secret(value: object, *, auto_rewrite: bool) -> str:
+def _loop_guard_secret(value: object, *, rewrite_enabled: bool) -> str:
     """The rewrite pipeline needs a per-mailbox secret so it can stamp inserted
     copies with an HMAC that the watcher recognizes as its own. A header-only
     marker would be trivially forged by any sender — the secret is what binds
-    the marker to *this* installation. Required iff auto_rewrite is on.
+    the marker to *this* installation. Required when rewriting is enabled
+    (i.e. `rewrite_only_from` is non-empty).
     """
     secret = str(value or "").strip()
-    if auto_rewrite and len(secret) < 16:
+    if rewrite_enabled and len(secret) < 16:
         raise ValueError(
             "loop_guard_secret must be set to at least 16 characters when "
-            "auto_rewrite is true (used as the HMAC key that recognizes our "
-            "own rewritten messages). Generate one with either "
+            "rewrite_only_from is non-empty (used as the HMAC key that "
+            "recognizes our own rewritten messages). Generate one with either "
             "`openssl rand -base64 32` or "
             "`python -c 'import secrets;print(secrets.token_urlsafe(32))'`."
         )
     return secret
+
+
+def _rewrite_only_from(value: object, *, field: str = "rewrite_only_from") -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError(f"{field} must be a list of regex strings")
+    out: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str):
+            raise ValueError(f"{field} must be a list of regex strings")
+        pat = entry.strip()
+        if not pat:
+            continue
+        try:
+            re.compile(pat)
+        except re.error as exc:
+            raise ValueError(f"{field}: invalid regex {pat!r}: {exc}") from exc
+        out.append(pat.lower())
+    return tuple(out)
+
+
+def _sender_whitelist(value: object, *, field: str = "sender_whitelist") -> tuple[str, ...]:
+    if value is None:
+        return _DEFAULT_SENDER_WHITELIST
+    if not isinstance(value, list):
+        raise ValueError(f"{field} must be a list of regex strings")
+    out: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str):
+            raise ValueError(f"{field} must be a list of regex strings")
+        pat = entry.strip()
+        if not pat:
+            continue
+        try:
+            re.compile(pat)
+        except re.error as exc:
+            raise ValueError(f"{field}: invalid regex {pat!r}: {exc}") from exc
+        out.append(pat.lower())
+    return tuple(out)
 
 
 def _bool(value: object, field: str) -> bool:
@@ -124,16 +180,19 @@ class Config:
     defang_on_external: str
     sender_lookalike_max_distance: int
     sender_min_domain_age_days: int
+    sender_whitelist: tuple[str, ...]
     check_phases: tuple[tuple[str, ...], ...]
     check_phases_internal: tuple[tuple[str, ...], ...]
     external_warning_text: str
-    auto_rewrite: bool
+    external_warning_html: str
     loop_guard_secret: str
     rewrite_only_from: tuple[str, ...]
     admin_user: str
     pubsub_project_id: str
     pubsub_topic: str
     pubsub_subscription: str
+    imap_host: str
+    imap_port: int
 
 
 def load_config(path: str | Path = "config.toml") -> Config:
@@ -191,6 +250,7 @@ def load_config(path: str | Path = "config.toml") -> Config:
         sender_min_domain_age_days=int(
             raw.get("sender_min_domain_age_days", 365)
         ),
+        sender_whitelist=_sender_whitelist(raw.get("sender_whitelist")),
         check_phases=_check_phases(raw.get("check_phases")),
         check_phases_internal=_check_phases(
             raw.get("check_phases_internal"),
@@ -200,14 +260,18 @@ def load_config(path: str | Path = "config.toml") -> Config:
         external_warning_text=str(
             raw.get("external_warning_text", _DEFAULT_EXTERNAL_WARNING_TEXT)
         ),
-        auto_rewrite=_bool(raw.get("auto_rewrite", False), "auto_rewrite"),
+        external_warning_html=str(
+            raw.get("external_warning_html", _DEFAULT_EXTERNAL_WARNING_HTML)
+        ),
         loop_guard_secret=_loop_guard_secret(
             raw.get("loop_guard_secret", ""),
-            auto_rewrite=_bool(raw.get("auto_rewrite", False), "auto_rewrite"),
+            rewrite_enabled=bool(_rewrite_only_from(raw.get("rewrite_only_from"))),
         ),
-        rewrite_only_from=tuple(raw.get("rewrite_only_from", []) or []),
+        rewrite_only_from=_rewrite_only_from(raw.get("rewrite_only_from")),
         admin_user=str(raw.get("admin_user", "") or ""),
         pubsub_project_id=str(raw.get("pubsub_project_id", "") or ""),
         pubsub_topic=str(raw.get("pubsub_topic", "") or ""),
         pubsub_subscription=str(raw.get("pubsub_subscription", "") or ""),
+        imap_host=str(raw.get("imap_host", "") or ""),
+        imap_port=int(raw.get("imap_port", 0) or 0),
     )

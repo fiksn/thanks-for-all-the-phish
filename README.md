@@ -58,7 +58,7 @@ personal GCP projects.
 
 1. Sign in at <https://console.cloud.google.com/> with your `@yourcompany.tld`
    account.
-2. Top bar → **Select a project → New Project**, e.g. `phish-tools`. Save.
+2. Top bar → **Select a project → New Project**, e.g. `thanks-for-all-the-phish`. Save.
 
 ### 3. Enable the Gmail API
 
@@ -75,7 +75,7 @@ In the new project: **APIs & Services → Library** → search **Gmail API** →
   - **External + Testing mode** — works for any user. Add your own email
     under **Test users**. The app stays in "Testing" and doesn't need
     Google verification.
-- App name: anything (e.g. `phish-tools`). Support email: yours. Save.
+- App name: anything (e.g. `thanks-for-all-the-phish`). Support email: yours. Save.
 - Scopes step can be left empty for a Desktop client — the actual scope is
   requested at runtime.
 
@@ -101,9 +101,10 @@ auth_mode = "oauth"
 client_secret_file = "client_secret.json"
 token_file = "token.json"
 
-# Destructive features: leave off while testing.
-auto_rewrite = false
-rewrite_only_from = ["you@yourcompany.tld"]
+# Destructive feature: leave empty while testing. Each entry is a regex matched
+# (re.fullmatch) against the lowercased From: address. Empty list disables
+# rewriting entirely. Use [".*"] once you trust the round-trip.
+rewrite_only_from = []
 ```
 
 ### 7. First run — read-only
@@ -128,17 +129,17 @@ something with a password input form) to confirm warnings render.
 In `config.toml`:
 
 ```toml
-auto_rewrite = true
-rewrite_only_from = ["you@yourcompany.tld"]   # start strict
+rewrite_only_from = ["you@yourcompany\\.tld"]   # start strict
+loop_guard_secret = "…32-byte secret…"          # required once non-empty
 ```
 
-Restart `python -m tfatp`. Mail from senders in `rewrite_only_from` that trip
-a warning gets deleted and replaced with a rewritten copy that has the
-original attached as `original.eml`. Mail from senders not in the allowlist
-is left alone — the watcher logs why it skipped.
+Restart `python -m tfatp`. Mail from senders matching `rewrite_only_from` that
+trip a warning gets deleted and replaced with a rewritten copy that has the
+original attached as `original.eml`. Mail from senders that don't match is
+left alone — the watcher logs why it skipped.
 
-Once you trust the round-trip, broaden `rewrite_only_from` (empty list = no
-restriction).
+Once you trust the round-trip, broaden the list (`[".*"]` matches every
+sender). An empty list disables rewriting entirely.
 
 ### 9. Keep it running
 
@@ -325,12 +326,11 @@ The corrected `.eml`:
 ## Rewrite-in-place
 
 `maybe_rewrite_new_mail(client, message_id)` deletes the original and inserts
-the corrected copy. It's gated by three independent checks:
+the corrected copy. It's gated by two independent checks:
 
-1. `auto_rewrite = true` in config.
-2. The message's `From:` address is in `rewrite_only_from` (empty list = no
-   restriction).
-3. At least one warning was raised by the analysis.
+1. The message's `From:` address matches a regex in `rewrite_only_from`.
+   Empty list disables rewriting; `[".*"]` enables it for every sender.
+2. At least one warning was raised by the analysis.
 
 Skipped messages log the reason. The deletion is permanent — the original is
 preserved only inside the attached `message/rfc822` part of the new message.
@@ -347,7 +347,7 @@ python -m tfatp.cli.replace_message --yes MESSAGE_ID < corrected.eml # commit
 
 1. **Bench, no OAuth.** Use a synthetic `.eml` via `analyze_eml` and inspect
    the rewritten output. No risk to live mail.
-2. **OAuth, read-only.** `auto_rewrite = false`, run `python -m tfatp`, send
+2. **OAuth, read-only.** `rewrite_only_from = []`, run `python -m tfatp`, send
    yourself a phishy mail and verify the warnings render correctly.
 3. **End-to-end without a real sender.** `inject_eml` writes an `.eml`
    straight into your inbox via `users.messages.insert`, so the watcher
@@ -371,16 +371,15 @@ python -m tfatp.cli.replace_message --yes MESSAGE_ID < corrected.eml # commit
 
    Notes: the injected message's `From:` is whatever the `.eml` carries —
    if SMTP-verify is on, it will probe the real MX of that domain. Pair
-   with `smtp_verify = false` for fully offline runs. `auto_rewrite` plus
-   `rewrite_only_from` still apply; if the injected `From:` isn't in the
-   allowlist you'll see "suspicious but sender not in rewrite_only_from".
+   with `smtp_verify = false` for fully offline runs. `rewrite_only_from`
+   still applies; if the injected `From:` doesn't match you'll see
+   "suspicious but sender … does not match rewrite_only_from".
 4. **One specific message.** `analyze_eml` → `replace_message --yes <id>` for
    one known-bad message. Confirm the new mail looks right in Gmail.
-5. **Automatic, allowlist-gated.** `auto_rewrite = true`,
-   `rewrite_only_from = ["alice@example.com"]`,
+5. **Automatic, allowlist-gated.** `rewrite_only_from = ["alice@example\\.com"]`,
    `loop_guard_secret = "<32+ random chars>"`. Mail from anyone else is
    skipped; mail from yourself gets rewritten.
-6. **Open up.** Empty `rewrite_only_from` once you trust the round-trip.
+6. **Open up.** Set `rewrite_only_from = [".*"]` once you trust the round-trip.
 
 ## Library overview
 

@@ -59,6 +59,14 @@ smtp_verify = true
 # unresolvable registration date is treated as "too young" for this check).
 sender_min_domain_age_days = 365
 
+# Sender hosts matching any of these regexes (re.fullmatch) skip the
+# sender-side checks (sender_domain_age, sender_lookalike, smtp_verify).
+# Match is against the full host of the From: address (lowercased), e.g.
+# "tenant.atlassian.net". Atlassian cloud is the canonical example: each
+# tenant gets its own young subdomain that trips every sender heuristic
+# without being malicious.
+sender_whitelist = ['.*\.atlassian\.net']
+
 # Ordered phases of checks. All checks in a phase run; if ANY check in a phase
 # is suspicious, every later phase is skipped — its checks are not run and
 # its network actions are not taken. The default cascade is:
@@ -96,23 +104,27 @@ check_phases_internal = [
 # never gates other phases. Remove `external_warning` from check_phases to
 # suppress the banner entirely.
 external_warning_text = "Sender is external to the organization, beware."
+# HTML version, used when the body is text/html. Rendered verbatim — you own
+# the markup and styling. Default is a yellow boxed banner.
+external_warning_html = '''<div style="border:2px solid #b58900; background:#fffbe6; padding:12px; margin:0 0 16px 0; font-family:Roboto,Arial,Helvetica,sans-serif; font-size:14px; color:#5a4a00;"><div style="font-weight:bold;">Sender is external to the organization, beware.</div></div>'''
 
-# Delete the original message and insert a rewritten copy when warnings are found.
-# DESTRUCTIVE: leave false until you trust the pipeline.
-auto_rewrite = false
-
-# Required when auto_rewrite is true. Used as the HMAC key that stamps every
-# inserted copy with an X-Checked-Mac header, so the watcher recognizes our
-# own rewrites and doesn't loop. A header-only marker would be trivially
-# forged by any sender — keep this secret. Generate one with either:
+# Required when rewrite_only_from is non-empty. Used as the HMAC key that
+# stamps every inserted copy with an X-Checked-Mac header, so the watcher
+# recognizes our own rewrites and doesn't loop. A header-only marker would be
+# trivially forged by any sender — keep this secret. Generate one with either:
 #   openssl rand -base64 32
 #   python -c "import secrets; print(secrets.token_urlsafe(32))"
 loop_guard_secret = ""
 
-# Safety gate: only rewrite messages whose From: matches one of these addresses.
-# Use this while testing — send yourself a phishy-looking mail and verify the
-# round-trip before opening it up. Empty list = no restriction (apply to all senders).
-rewrite_only_from = ["alice@example.com"]
+# Rewrite gate: each entry is a regex matched (re.fullmatch) against the bare,
+# lowercased From: address. A matching address whose mail is suspicious gets
+# its original deleted and a rewritten copy inserted.
+#   []          → rewriting disabled (no sender matches; default)
+#   [".*"]      → every sender (DESTRUCTIVE; only after you trust the round-trip)
+#   ['alice@example\.com', '.*@yourcompany\.tld']
+#               → exact address, then everyone on a domain
+# Once non-empty, loop_guard_secret above must be set.
+rewrite_only_from = []
 
 # --- domain-wide (DWD) settings — only used by `python -m tfatp.cli.watch_domain` ---
 
@@ -125,3 +137,8 @@ admin_user = ""
 pubsub_project_id = ""
 pubsub_topic = ""
 pubsub_subscription = ""
+
+# IMAP server used by the IDLE watcher. Defaults to Gmail's (imap.gmail.com:993).
+# Override only for non-Gmail setups or test servers.
+imap_host = "imap.gmail.com"
+imap_port = 993

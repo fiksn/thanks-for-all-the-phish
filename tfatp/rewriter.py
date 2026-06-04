@@ -21,9 +21,13 @@ def replace_message(client: GmailClient, message_id: str, new_raw: bytes) -> str
     message embeds the original as a message/rfc822 attachment, so the content is
     preserved inside the new message.
     """
+    print(f"[rewrite] insert: {len(new_raw)} bytes", file=sys.stderr)
     new_id = client.insert_message(new_raw)
+    print(f"[rewrite] inserted new_id={new_id}", file=sys.stderr)
     # Delete only after insert succeeds, so a failed insert doesn't lose the mail.
+    print(f"[rewrite] delete: old_id={message_id}", file=sys.stderr)
     client.delete_message(message_id)
+    print(f"[rewrite] deleted old_id={message_id}", file=sys.stderr)
     return new_id
 
 
@@ -33,8 +37,8 @@ def maybe_rewrite_new_mail(
     """Inspect a freshly-arrived message and, if eligible, replace it in-place.
 
     Eligibility:
-    - config.auto_rewrite must be true
-    - From: address must pass the rewrite_only_from allowlist
+    - From: address must match a regex in config.rewrite_only_from
+      (empty list disables rewriting; [".*"] enables it for every sender)
     - the message must have at least one warning (suspicious link)
 
     Returns (rewritten, findings, new_message_id).
@@ -47,6 +51,7 @@ def maybe_rewrite_new_mail(
     # running the pipeline a second time. A header-only marker would be
     # trivially forged by any sender; the MAC binds it to the secret.
     if loop_guard.is_own_rewrite(parsed, cfg.loop_guard_secret):
+        print(f"{log_prefix} id={message_id} own rewrite; skipping", file=sys.stderr)
         return False, [], None
     from_header = str(parsed.get("From", ""))
 
@@ -55,9 +60,10 @@ def maybe_rewrite_new_mail(
     # mailbox we just received the message at, not the workspace-config knob.
     helo = client.user.split("@", 1)[1] if "@" in client.user else "localhost"
     org_domains = client.org_domains
+    print(f"{log_prefix} id={message_id} analyze: running gate", file=sys.stderr)
     (
-        findings, smtp_result, sender_lookalike, _sender_age_warning,
-        _enabled, _gate_failed, external_warning_triggered,
+        findings, smtp_result, sender_lookalike, sender_age_warning,
+        enabled, gate_failed, external_warning_triggered,
     ) = analyze_with_gate(
         raw,
         mail_from=client.user,
@@ -69,7 +75,34 @@ def maybe_rewrite_new_mail(
         check_phases=cfg.check_phases,
         check_phases_internal=cfg.check_phases_internal,
         org_domains=org_domains,
+        sender_whitelist=cfg.sender_whitelist,
     )
+
+    def _phase(stage: str, outcome: str) -> None:
+        print(f"{log_prefix} id={message_id} phase:{stage} {outcome}", file=sys.stderr)
+
+    if sender_age_warning:
+        _phase("sender_domain_age", f"FAIL ({sender_age_warning})")
+    if sender_lookalike is not None:
+        _phase(
+            "sender_lookalike",
+            "FAIL" if sender_lookalike.matched else "ok",
+        )
+    if smtp_result is not None:
+        _phase("smtp_verify", f"{smtp_result.status} ({smtp_result.detail})")
+    if enabled["check_link_domain_age"] or enabled["check_link_lookalike"]:
+        link_warns = sum(1 for f in findings for w in f.warnings if "link" in w or "young" in w)
+        _phase(
+            "link_checks",
+            f"{len(findings)} link(s), {link_warns} warning(s)",
+        )
+    if enabled["check_password_form"]:
+        pw = sum(1 for f in findings if f.has_password_form)
+        _phase("check_password_form", f"fetched URLs, {pw} with password form")
+    if external_warning_triggered:
+        _phase("external_warning", "sender external (yellow banner)")
+    if gate_failed:
+        _phase("gate", "tripped — later phases skipped")
 
     suspicious = (
         any(f.warnings for f in findings)
@@ -80,16 +113,15 @@ def maybe_rewrite_new_mail(
     # other check fired — otherwise a clean external mail never picks up the
     # yellow banner because the rewrite gate is closed.
     if not suspicious and not external_warning_triggered:
-        return False, findings, None
-    if not cfg.auto_rewrite:
-        print(f"{log_prefix} suspicious but auto_rewrite=false; skipping", file=sys.stderr)
+        print(f"{log_prefix} id={message_id} clean; no action", file=sys.stderr)
         return False, findings, None
     if not sender_allowed(from_header, cfg.rewrite_only_from):
-        print(
-            f"{log_prefix} suspicious but sender {extract_address(from_header)!r} "
-            f"not in rewrite_only_from allowlist; skipping",
-            file=sys.stderr,
+        reason = (
+            "rewrite_only_from is empty (rewriting disabled)"
+            if not cfg.rewrite_only_from
+            else f"sender {extract_address(from_header)!r} does not match rewrite_only_from"
         )
+        print(f"{log_prefix} suspicious but {reason}; skipping", file=sys.stderr)
         return False, findings, None
 
     defang_policy = DefangPolicy(
@@ -111,12 +143,14 @@ def maybe_rewrite_new_mail(
         external_warning=external_warning_triggered,
     )
     annotated = rewrite_body(body, body_subtype, findings, neutralize_all, per_url)
-    yellow_text = cfg.external_warning_text if external_warning_triggered else ""
+    intro_text = cfg.external_warning_text if external_warning_triggered else ""
+    intro_html = cfg.external_warning_html if external_warning_triggered else ""
     new_raw = build_corrected_eml(
         raw, annotated, findings, smtp_result, sender_lookalike, neutralize_all,
         loop_guard_secret=cfg.loop_guard_secret,
         body_subtype=body_subtype,
-        external_warning_text=yellow_text,
+        external_warning_text=intro_text,
+        external_warning_html=intro_html,
     )
 
     print(

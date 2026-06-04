@@ -119,15 +119,15 @@ def test_corrected_html_banner_suppressed_when_no_findings():
     assert "thanks-for-all-the-phish analysis" not in body
 
 
-def test_yellow_banner_renders_when_external_warning_text_set():
+def test_external_warning_html_renders_verbatim_in_html_body():
     raw = _html_eml('<p>hi</p>')
+    custom = '<div class="my-banner">Sender is external.</div>'
     corrected = build_corrected_eml(
         raw, "<p>hi</p>", [], body_subtype="html",
-        external_warning_text="Sender is external.",
+        external_warning_html=custom,
     )
     body = _decoded_html(corrected)
-    assert "Sender is external." in body
-    assert "#b58900" in body  # yellow border
+    assert custom in body
     # No analysis banner when nothing else fired.
     assert "thanks-for-all-the-phish analysis" not in body
 

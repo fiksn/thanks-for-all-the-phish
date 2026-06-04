@@ -15,8 +15,15 @@ def extract_address(header_value: str) -> str:
 
 
 def sender_allowed(from_header: str, allowlist: tuple[str, ...]) -> bool:
-    """True if the empty allowlist (= any sender) or the From address matches."""
+    """Match the From: address against the allowlist of regexes (re.fullmatch).
+
+    Empty allowlist means rewriting is disabled (no sender matches). Use
+    `[".*"]` to allow every sender. Patterns are matched against the bare,
+    lowercased address.
+    """
     if not allowlist:
-        return True
+        return False
     addr = extract_address(from_header)
-    return addr in {a.strip().lower() for a in allowlist}
+    if not addr:
+        return False
+    return any(re.fullmatch(p, addr) for p in allowlist)

@@ -10,8 +10,8 @@ from tfatp.client import GmailClient, Message
 
 NewMailHook = Callable[[Message], None]
 
-IMAP_HOST = "imap.tfatp.com"
-IMAP_PORT = 993
+DEFAULT_IMAP_HOST = "imap.gmail.com"
+DEFAULT_IMAP_PORT = 993
 # RFC 2177 requires re-issuing IDLE at least every 29 minutes; Gmail drops earlier in practice.
 IDLE_REFRESH_SECONDS = 25 * 60
 
@@ -28,6 +28,8 @@ class IdleWatcher:
         self._user = client.user
         self._hooks: list[NewMailHook] = []
         self._creds = get_credentials(client.config, subject=self._user)
+        self._host = client.config.imap_host or DEFAULT_IMAP_HOST
+        self._port = client.config.imap_port or DEFAULT_IMAP_PORT
 
     def on_new_mail(self, hook: NewMailHook) -> NewMailHook:
         self._hooks.append(hook)
@@ -42,7 +44,7 @@ class IdleWatcher:
 
     def _connect(self) -> IMAPClient:
         token = fresh_access_token(self._creds)
-        imap = IMAPClient(IMAP_HOST, port=IMAP_PORT, ssl=True)
+        imap = IMAPClient(self._host, port=self._port, ssl=True)
         imap.oauth2_login(self._user, token)
         imap.select_folder("INBOX")
         return imap
@@ -84,7 +86,7 @@ class IdleWatcher:
         return api_ids, max(uids)
 
     def run(self) -> None:
-        print(f"[idle] connecting to {IMAP_HOST} as {self._user}")
+        print(f"[idle] connecting to {self._host}:{self._port} as {self._user}")
         imap = self._connect()
         last_uid = self._highest_uid(imap)
         print(f"[idle] watching INBOX from UID>{last_uid}")

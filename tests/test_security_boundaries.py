@@ -53,19 +53,22 @@ def test_fetch_url_ignores_password_form_after_response_cap(monkeypatch):
 def test_smtp_verify_skips_mx_host_with_private_address(monkeypatch):
     smtp_verify.verify_sender.cache_clear()
     monkeypatch.setattr(smtp_verify, "_mx_hosts", lambda domain: ["mx.attacker.test"])
-    monkeypatch.setattr(
-        smtp_verify.socket,
-        "getaddrinfo",
-        lambda host, port, type: [
-            (
-                smtp_verify.socket.AF_INET,
-                smtp_verify.socket.SOCK_STREAM,
-                6,
-                "",
-                ("10.0.0.5", 0),
-            )
-        ],
-    )
+
+    class _Rdata:
+        def __init__(self, ip: str) -> None:
+            self._ip = ip
+        def __str__(self) -> str:
+            return self._ip
+
+    class _FakeResolver:
+        lifetime = 1.0
+        timeout = 1.0
+        def resolve(self, host, qtype):
+            if qtype == "A":
+                return [_Rdata("10.0.0.5")]
+            raise smtp_verify.DNSException("no AAAA")
+
+    monkeypatch.setattr(smtp_verify, "_resolver", _FakeResolver)
 
     def probe(*args, **kwargs):
         raise AssertionError("private MX host must not be probed")

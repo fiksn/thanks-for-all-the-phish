@@ -8,7 +8,6 @@ def _write_config(path, **overrides) -> None:
         "domain": '"example.com"',
         "user": '"user@example.com"',
         "smtp_verify": "true",
-        "auto_rewrite": "false",
     }
     values.update(overrides)
     body = "\n".join(f"{key} = {value}" for key, value in values.items())
@@ -17,17 +16,33 @@ def _write_config(path, **overrides) -> None:
 
 def test_string_false_boolean_config_is_false(tmp_path):
     config_path = tmp_path / "config.toml"
-    _write_config(config_path, smtp_verify='"false"', auto_rewrite='"false"')
+    _write_config(config_path, smtp_verify='"false"')
 
     cfg = load_config(config_path)
 
     assert cfg.smtp_verify is False
-    assert cfg.auto_rewrite is False
 
 
 def test_invalid_boolean_string_is_rejected(tmp_path):
     config_path = tmp_path / "config.toml"
-    _write_config(config_path, auto_rewrite='"definitely"')
+    _write_config(config_path, smtp_verify='"definitely"')
 
-    with pytest.raises(ValueError, match="auto_rewrite must be a boolean"):
+    with pytest.raises(ValueError, match="smtp_verify must be a boolean"):
         load_config(config_path)
+
+
+def test_rewrite_only_from_rejects_invalid_regex(tmp_path):
+    config_path = tmp_path / "config.toml"
+    _write_config(config_path, rewrite_only_from='["[unclosed"]')
+
+    with pytest.raises(ValueError, match="rewrite_only_from"):
+        load_config(config_path)
+
+
+def test_rewrite_only_from_defaults_to_empty(tmp_path):
+    config_path = tmp_path / "config.toml"
+    _write_config(config_path)
+
+    cfg = load_config(config_path)
+
+    assert cfg.rewrite_only_from == ()
