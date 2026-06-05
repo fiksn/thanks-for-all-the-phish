@@ -27,6 +27,13 @@ from tfatp.dkim_verify import verify as verify_dkim
 from tfatp.link_analysis import (
     DEFAULT_YOUNG_DOMAIN_DAYS,
     LinkFinding,
+    LinkLookalike,
+    LinkTextMismatch,
+    PasswordForm,
+    RedirectorResolves,
+    SenderDomainAge,
+    UrlInSubject,
+    YoungDomain,
     analyze,
     annotate,
     annotate_html,
@@ -87,18 +94,72 @@ def _banner_lines(
     if smtp_result is not None:
         suffix = " — all links defanged below" if neutralize_all else ""
         top.append(f"SMTP: {smtp_result.status} ({smtp_result.detail}){suffix}")
-    warnings: list[str] = []
+
+    young_known: dict[str, int] = {}        # domain -> youngest age seen
+    young_unknown: set[str] = set()
+    lookalike_targets: dict[str, set[str]] = {}  # target -> impersonating domains
+    password: set[str] = set()
+    redirector: dict[str, str] = {}         # source domain -> final domain (or "")
+    subject_urls: set[str] = set()
+    link_text_mismatch: set[str] = set()    # rendered per-link sentence
+    sender_notes: list[str] = []
+    other: list[str] = []                   # attachments, header anomalies, fallbacks
+    defanged_cascade: set[str] = set()
+
     for f in findings:
-        if f.warnings:
-            shown = defang(f.url) if neutralize_all else f.url
-            warnings.append(f"{shown}  ({'; '.join(f.warnings)})")
-    # When defang escalates to the whole body, list the URLs that got neutered
-    # even when their finding had no per-link warning. Otherwise the recipient
-    # has no idea WHY the message is full of hxxps:// strings.
+        for w in f.warnings:
+            if isinstance(w, SenderDomainAge):
+                sender_notes.append(str(w))
+            elif isinstance(w, YoungDomain):
+                if w.age_days is None:
+                    young_unknown.add(w.domain)
+                elif w.domain not in young_known or w.age_days < young_known[w.domain]:
+                    young_known[w.domain] = w.age_days
+            elif isinstance(w, LinkLookalike):
+                lookalike_targets.setdefault(w.target, set()).add(w.domain)
+            elif isinstance(w, PasswordForm):
+                password.add(w.domain or "(unknown)")
+            elif isinstance(w, RedirectorResolves):
+                redirector[w.domain or "(unknown)"] = w.final_domain
+            elif isinstance(w, UrlInSubject):
+                subject_urls.add(w.domain or "(unknown)")
+            elif isinstance(w, LinkTextMismatch):
+                link_text_mismatch.add(str(w))
+            else:
+                # AttachmentIssue, HeaderAnomaly — no domain to aggregate on.
+                other.append(str(w))
+
+    # When defang escalates to the whole body, surface the domains that got
+    # neutralised even when their per-link check produced no warning of its own —
+    # otherwise the recipient sees hxxps:// everywhere with no explanation.
     if neutralize_all:
         for f in findings:
             if not f.warnings and f.url and "://" in f.url:
-                warnings.append(f"{defang(f.url)}  (defanged: phase failed earlier)")
+                defanged_cascade.add(f.domain or f.host or "(unknown)")
+
+    warnings: list[str] = list(sender_notes)
+    if young_known or young_unknown:
+        parts = [f"{d} ({age}d)" for d, age in sorted(young_known.items())]
+        parts += [f"{d} (age unknown)" for d in sorted(young_unknown)]
+        warnings.append("Young domains: " + ", ".join(parts))
+    for target in sorted(lookalike_targets):
+        doms = ", ".join(sorted(lookalike_targets[target]))
+        warnings.append(f"Domains impersonating {target}: {doms}")
+    if password:
+        warnings.append("Password form at: " + ", ".join(sorted(password)))
+    if redirector:
+        parts = [
+            f"{src} → {redirector[src]}" if redirector[src] else src
+            for src in sorted(redirector)
+        ]
+        warnings.append("Redirector/tracking links: " + ", ".join(parts))
+    if subject_urls:
+        warnings.append("URLs in Subject from: " + ", ".join(sorted(subject_urls)))
+    warnings.extend(sorted(link_text_mismatch))
+    warnings.extend(other)
+    if defanged_cascade:
+        warnings.append("Defanged (gate tripped earlier): "
+                        + ", ".join(sorted(defanged_cascade)))
     return top, warnings
 
 
@@ -192,7 +253,8 @@ def build_corrected_eml(
     if sender_lookalike is not None and sender_lookalike.matched:
         new_msg["X-Checked-Sender-Lookalike"] = sender_lookalike.detail
     suspect_summary = "; ".join(
-        f"{f.url} -> {', '.join(f.warnings)}" for f in findings if f.warnings
+        f"{f.url} -> {', '.join(str(w) for w in f.warnings)}"
+        for f in findings if f.warnings
     )
     if suspect_summary:
         new_msg["X-Checked-Findings"] = suspect_summary
@@ -316,7 +378,7 @@ def analyze_with_gate(
 
     smtp_result: SmtpVerifyResult | None = None
     sender_lookalike: LookalikeResult | None = None
-    sender_age_warning: str | None = None
+    sender_age: SenderDomainAge | None = None
     enabled = {
         "check_link_domain_age": False,
         "check_link_lookalike": False,
@@ -332,15 +394,15 @@ def analyze_with_gate(
             if stage == "sender_domain_age" and sender_domain and not sender_whitelisted:
                 age = domain_age_days(sender_domain)
                 if age is None:
-                    sender_age_warning = (
-                        f"sender domain age unknown for {sender_domain} "
-                        "(treated as too young)"
+                    sender_age = SenderDomainAge(
+                        domain=sender_domain, age_days=None,
+                        min_required=sender_min_domain_age_days,
                     )
                     phase_failed = True
                 elif age < sender_min_domain_age_days:
-                    sender_age_warning = (
-                        f"sender domain age {age}d < {sender_min_domain_age_days}d "
-                        f"for {sender_domain}"
+                    sender_age = SenderDomainAge(
+                        domain=sender_domain, age_days=age,
+                        min_required=sender_min_domain_age_days,
                     )
                     phase_failed = True
             elif (
@@ -398,10 +460,11 @@ def analyze_with_gate(
                 max_distance=sender_lookalike_max_distance,
             )
             if res.matched:
-                item.warnings.append(
-                    f"link domain lookalike of {protected_domain} "
-                    f"({item.domain}, distance {res.distance})"
-                )
+                item.warnings.append(LinkLookalike(
+                    domain=item.domain,
+                    target=protected_domain,
+                    distance=res.distance,
+                ))
 
     # Per-phase model for link stages: only fetch URLs (check_password_form)
     # if it sits in a strictly later phase than the link-data checks AND no
@@ -437,7 +500,7 @@ def analyze_with_gate(
     if enabled["check_password_form"]:
         if gates_before_fetch:
             link_data_failed = any(
-                "young domain" in w or "link domain lookalike" in w
+                isinstance(w, (YoungDomain, LinkLookalike))
                 for f in findings for w in f.warnings
             )
             if link_data_failed:
@@ -457,7 +520,7 @@ def analyze_with_gate(
     # the same way link warnings do.
     findings.extend(scan_attachments(raw))
 
-    if sender_age_warning:
+    if sender_age is not None:
         findings.append(
             LinkFinding(
                 url="sender:age",
@@ -465,11 +528,12 @@ def analyze_with_gate(
                 domain=sender_domain,
                 age_days=None,
                 has_password_form=False,
-                warnings=[sender_age_warning],
+                warnings=[sender_age],
             )
         )
     return (
-        findings, smtp_result, sender_lookalike, sender_age_warning,
+        findings, smtp_result, sender_lookalike,
+        str(sender_age) if sender_age is not None else None,
         enabled, gate_failed, external_warning_triggered,
     )
 
@@ -560,7 +624,7 @@ def run(raw: bytes, young_domain_days: int, quiet: bool,
             print("  links   :", file=sys.stderr)
             for f in findings:
                 age = f"{f.age_days}d" if f.age_days is not None else "unknown"
-                flags = ", ".join(f.warnings) if f.warnings else "ok"
+                flags = ", ".join(str(w) for w in f.warnings) if f.warnings else "ok"
                 print(f"    - {f.url}  (domain={f.domain}, age={age}, {flags})",
                       file=sys.stderr)
         else:

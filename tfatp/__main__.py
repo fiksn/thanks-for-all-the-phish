@@ -33,7 +33,7 @@ def _print_message(prefix: str, client: GmailClient, msg: Message) -> None:
         print("  links   :")
         for f in findings:
             age = f"{f.age_days}d" if f.age_days is not None else "unknown"
-            flags = ", ".join(f.warnings) if f.warnings else "ok"
+            flags = ", ".join(str(w) for w in f.warnings) if f.warnings else "ok"
             print(f"    - {f.url}  (domain={f.domain}, age={age}, {flags})")
 
     print("  --- body ---")

@@ -5,7 +5,7 @@ from email import policy
 from email.message import EmailMessage
 
 from tfatp.analyze_eml import build_corrected_eml, rewrite_body
-from tfatp.link_analysis import LinkFinding
+from tfatp.link_analysis import LinkFinding, PasswordForm, YoungDomain
 
 
 def _html_eml(body: str) -> bytes:
@@ -71,10 +71,10 @@ def test_rewrite_body_html_annotates_anchor_with_warning():
     findings = [LinkFinding(
         url="https://bad.example/x", host="bad.example", domain="bad.example",
         age_days=10, has_password_form=False,
-        warnings=["young domain - 10d"],
+        warnings=[YoungDomain(domain="bad.example", age_days=10)],
     )]
     out = rewrite_body(body, "html", findings=findings, neutralize_all=False, per_url=set())
-    assert "[WARNING: young domain - 10d]" in out
+    assert "[WARNING: young (10d)]" in out
     assert "color:#c00" in out
 
 
@@ -92,9 +92,11 @@ def test_corrected_html_banner_lists_defanged_urls_when_neutralize_all():
         raw, annotated, findings, neutralize_all=True, body_subtype="html",
     )
     body = _decoded_html(corrected)
-    # The URL is enumerated in the banner with the defanged form.
-    assert "hxxps://bad.example/x" in body
-    assert "defanged: phase failed earlier" in body
+    # The domain is enumerated under the cascade-defang line; URLs no
+    # longer appear in warning text (would be clickable).
+    assert "Defanged (gate tripped earlier)" in body
+    assert "bad.example" in body
+    assert "https://bad.example/x" not in body  # not surfaced in warnings
     # Original HTML structure stayed
     assert "<a " in body
 
@@ -104,7 +106,7 @@ def test_corrected_html_banner_uses_html_styling():
     finding = LinkFinding(
         url="https://bad.example/x", host="bad.example", domain="bad.example",
         age_days=1, has_password_form=True,
-        warnings=["password form detected"],
+        warnings=[PasswordForm(domain="bad.example")],
     )
     corrected = build_corrected_eml(raw, "<p>hi</p>", [finding], body_subtype="html")
     body = _decoded_html(corrected)

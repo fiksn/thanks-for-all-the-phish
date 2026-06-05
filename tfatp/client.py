@@ -88,6 +88,27 @@ class GmailClient:
         )
         return Message.from_api(payload)
 
+    def resolve_message_id(self, identifier: str) -> str:
+        """Return Gmail's internal hex id for either a hex id or an RFC 822 Message-ID.
+
+        An RFC 822 Message-ID looks like ``<abc@host>`` or ``abc@host`` — i.e. it
+        contains an ``@``. Hex ids never do, so the ``@`` is a reliable discriminator.
+        Raises ``LookupError`` if the RFC 822 id matches no message in the mailbox.
+        """
+        if "@" not in identifier:
+            return identifier
+        rfc_id = identifier.strip().lstrip("<").rstrip(">")
+        resp = (
+            self._service.users()
+            .messages()
+            .list(userId=self._user_id, q=f"rfc822msgid:{rfc_id}", maxResults=1)
+            .execute()
+        )
+        messages = resp.get("messages", [])
+        if not messages:
+            raise LookupError(f"no message with Message-ID <{rfc_id}> in this mailbox")
+        return messages[0]["id"]
+
     def get_raw_message(self, message_id: str) -> bytes:
         """Return the raw RFC822 bytes of a message (needed for DKIM verification)."""
         payload = (

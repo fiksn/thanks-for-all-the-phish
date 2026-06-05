@@ -292,8 +292,13 @@ For each URL extracted from the body:
 - **Domain age** via RDAP at `https://rdap.org/domain/{domain}`. LRU-cached
   (`maxsize=512`, repeat lookups are free).
 - **Password form check**: fetches the URL with a real Chrome 131 User-Agent
-  and `Sec-Ch-Ua-*` headers, parses with BeautifulSoup, looks for
-  `<input type="password">`. LRU-cached.
+  and `Sec-Ch-Ua-*` headers, parses with BeautifulSoup. Flags a credential
+  prompt on any of:
+  - `<input type="password">`
+  - `<input>` whose `name`/`id`/`placeholder`/`autocomplete` mentions
+    `password`/`passwd`/`pwd`/`pass` (catches `type="text"` flipped by JS)
+  - inline-script literals like `type:"password"` or `autocomplete="current-password"`
+  LRU-cached. See **Known limitations** below for what this still misses.
 
 Suspicious URLs (`age < config.young_domain_days` or password input found) get
 `[WARNING: ...]` appended inline in the displayed body. The URL itself is
@@ -306,6 +311,65 @@ body = message_body_text(raw_eml_bytes)
 findings = analyze_links(body, young_domain_days=365)
 print(annotate_links(body, findings))
 ```
+
+## Known limitations
+
+This is a small, static-only scanner. Treating any single check as authoritative
+will give you false confidence; the phase model is designed so several signals
+have to agree before a message is rewritten. Specific gaps worth knowing:
+
+**Password-form detection (static HTML only).** The fetch parses the bytes the
+server sent — no JavaScript executes. A modern phishing kit hosted as an SPA
+(React/Vue/Svelte) ships a near-empty `<body>` and renders the credential prompt
+client-side; we will see no password field. Likewise missed:
+- forms injected on a click handler or after a `fetch(...)` for an "email-first"
+  screen
+- credential UIs loaded inside an `<iframe>` (we only inspect the top frame)
+- WASM-rendered UIs
+- credential capture without a form at all — pages that say "paste the code from
+  your authenticator below" into a plain text field, then exfiltrate over fetch
+A headless browser (Playwright) would close most of these gaps at the cost of
+~200 MB of Chromium, several seconds per URL, and a much bigger CVE surface.
+We do not run one. Outsourcing to a feed like urlscan.io or Safe Browsing is the
+intended escape hatch once static checks are not enough.
+
+**Domain age (RDAP).** We treat "RDAP returned nothing usable" as "young." That
+defaults safe but produces false positives for ccTLDs with thin or missing RDAP
+service. Three-attempt retry with backoff is in place, but a sustained outage at
+`rdap.org` degrades every check using it.
+
+**Lookalike (Levenshtein).** String distance only. Catches `y0urbank.com` /
+`yourbamk.com`-style typosquats. Misses homoglyph attacks (`уоurbank.com` with
+Cyrillic letters), IDN-encoded variants, and visually-similar TLD swaps
+(`yourbank.co` vs `yourbank.com`). The check runs against your registered org
+domains; anyone targeting a brand you don't own is invisible.
+
+**SMTP probe.** Sends `RCPT TO:<sender>` and reads the response. Many providers
+(Google, Outlook, Proton) accept-then-bounce as policy, so a clean SMTP result
+proves the MX exists, not that the sender does. Treat it as one signal, not a
+verdict.
+
+**DKIM.** Verified on the original bytes only and surfaced display-only — never
+used for scoring, gating, or defang. A DKIM pass does not vouch for the sender's
+intent; it only proves the signing domain held the key when the message was
+signed.
+
+**Attachment scanning.** OOXML (`.docx`/`.xlsm`/...) and legacy OLE
+(`.doc`/`.xls`/...) only. PDFs, HTML attachments, ISO/IMG containers, LNK files,
+script droppers, and signed installers are not inspected. Size-capped to 25 MB
+per attachment; anything larger is flagged as "too large to scan" but not
+analyzed.
+
+**Phases run sequentially, not in parallel.** The phase list is grouped to
+express "these checks gate together, the next group runs only if this one
+passes" — but inside a phase we still loop over stages one by one. There is no
+`asyncio.gather` or thread pool today. Latency is dominated by RDAP and the
+link-fetch GETs.
+
+**Outbound exposure.** Both the link fetch and the SMTP probe touch the
+sender's infrastructure from your IP. Anti-phish kits log that visit and may
+serve different content to repeat visitors. Route through a sandbox or proxy
+if attribution matters.
 
 ## .eml analysis without OAuth
 

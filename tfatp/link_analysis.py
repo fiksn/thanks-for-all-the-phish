@@ -84,13 +84,130 @@ _BROWSER_HEADERS = {
 
 
 @dataclass(frozen=True, slots=True)
+class YoungDomain:
+    """Link domain age is below the configured threshold."""
+    domain: str
+    age_days: int | None         # None means RDAP returned no usable answer
+
+    def __str__(self) -> str:
+        return f"young ({self.age_days}d)" if self.age_days is not None else "young (age unknown)"
+
+
+@dataclass(frozen=True, slots=True)
+class LinkLookalike:
+    """Link domain is a Levenshtein-close variant of an organization domain."""
+    domain: str
+    target: str
+    distance: int
+
+    def __str__(self) -> str:
+        return f"lookalike of {self.target} (distance {self.distance})"
+
+
+@dataclass(frozen=True, slots=True)
+class PasswordForm:
+    """Fetched page contains a form with a password input."""
+    domain: str
+
+    def __str__(self) -> str:
+        return "password form"
+
+
+@dataclass(frozen=True, slots=True)
+class RedirectorResolves:
+    """Link points at a known redirector; final_domain is empty when fetch was gated off."""
+    domain: str
+    final_domain: str
+
+    def __str__(self) -> str:
+        return (
+            f"redirector resolves to {self.final_domain}"
+            if self.final_domain
+            else "redirector (not resolved)"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LinkTextMismatch:
+    """Anchor text shows one domain, href points at a different one."""
+    displayed: str
+    actual: str
+    via_redirector: bool
+
+    def __str__(self) -> str:
+        verb = "redirector resolves to" if self.via_redirector else "href points to"
+        return f"link text shows {self.displayed} but {verb} {self.actual}"
+
+
+@dataclass(frozen=True, slots=True)
+class UrlInSubject:
+    """URL was lifted from the Subject header rather than the body."""
+    domain: str
+
+    def __str__(self) -> str:
+        return "URL appears in Subject header"
+
+
+@dataclass(frozen=True, slots=True)
+class SenderDomainAge:
+    """Sender's registrable domain is younger than the configured floor."""
+    domain: str
+    age_days: int | None         # None means RDAP returned no usable answer
+    min_required: int
+
+    def __str__(self) -> str:
+        if self.age_days is None:
+            return (
+                f"sender domain age unknown for {self.domain} "
+                f"(treated as too young)"
+            )
+        return (
+            f"sender domain age {self.age_days}d < {self.min_required}d "
+            f"for {self.domain}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AttachmentIssue:
+    """Attachment scanner flagged a payload (macros, zip bombs, etc.)."""
+    name: str
+    kind: str                    # 'macro' | 'bomb' | 'encrypted' | 'unreadable' | 'oversized' | 'scan_failed'
+    detail: str                  # human-readable specifics
+
+    def __str__(self) -> str:
+        return f"{self.detail} ({self.name})"
+
+
+@dataclass(frozen=True, slots=True)
+class HeaderAnomaly:
+    """Reply-To/From mismatch or pressure language in subject/body."""
+    detail: str
+
+    def __str__(self) -> str:
+        return self.detail
+
+
+Warning = (
+    YoungDomain
+    | LinkLookalike
+    | PasswordForm
+    | RedirectorResolves
+    | LinkTextMismatch
+    | UrlInSubject
+    | SenderDomainAge
+    | AttachmentIssue
+    | HeaderAnomaly
+)
+
+
+@dataclass(frozen=True, slots=True)
 class LinkFinding:
     url: str
     host: str
     domain: str
     age_days: int | None
     has_password_form: bool
-    warnings: list[str] = field(default_factory=list)
+    warnings: list[Warning] = field(default_factory=list)
 
 
 def _parse_html(content: str | bytes) -> BeautifulSoup:
@@ -343,8 +460,44 @@ def _fetch_url(url: str) -> tuple[str, bool]:
     except (drawbridge.DrawbridgeError, httpx.HTTPError):
         return url, False
     soup = _parse_html(body)
-    has_pwd = soup.find("input", attrs={"type": re.compile(r"^password$", re.I)}) is not None
-    return final_url, has_pwd
+    return final_url, _looks_like_login(soup, body)
+
+
+# Catch credential prompts that hide behind `type="text"` plus a JS reveal,
+# or that name the field naturally without setting the input type. The list
+# stays static-HTML only — JS-rendered SPAs need a headless browser, see the
+# Limitations section of the README.
+_PASSWORD_NAME_RE = re.compile(r"\b(password|passwd|pwd|pass)\b", re.I)
+_LOGIN_HINT_RE = re.compile(
+    rb"""(?ix)
+    (?: type \s* [:=] \s* ['"]password['"]      # JS literals: {type:"password"}
+      | autocomplete \s* = \s* ['"]?current-password
+      | autocomplete \s* = \s* ['"]?new-password
+      | id \s* = \s* ['"]passwd ['"]?
+      | <\s*input [^>]*\b name \s* = \s* ['"]?(password|passwd|pwd|pass)\b
+    )
+    """
+)
+
+
+def _looks_like_login(soup: BeautifulSoup, raw_body: bytes) -> bool:
+    """Return True if the fetched page exposes a credential prompt.
+
+    Static-HTML only. We look for the obvious `<input type=password>`, plus
+    inputs whose name/id/placeholder/autocomplete betray a password field even
+    when `type` is something else (a common evasion: `type="text"` flipped by
+    JS on focus). We also scan the raw bytes for inline-script literals like
+    `type:"password"` and HTML5 autocomplete hints. JavaScript-rendered SPAs
+    still slip through — see README "Known limitations".
+    """
+    if soup.find("input", attrs={"type": re.compile(r"^password$", re.I)}):
+        return True
+    for inp in soup.find_all("input"):
+        for attr in ("name", "id", "placeholder", "autocomplete"):
+            value = inp.get(attr, "")
+            if isinstance(value, str) and _PASSWORD_NAME_RE.search(value):
+                return True
+    return _LOGIN_HINT_RE.search(raw_body) is not None
 
 
 def _read_link_response(resp: httpx.Response) -> bytes:
@@ -413,7 +566,7 @@ def analyze(
             )
             # Surface origin so the analysis banner makes it clear the URL came
             # from a place a recipient would not normally expect to see one.
-            f.warnings.insert(0, "URL appears in Subject header")
+            f.warnings.insert(0, UrlInSubject(domain=f.domain))
             findings.append(f)
         _attach_anchor_deception_warnings(
             findings, raw_rfc822, resolve_redirectors=check_password_form
@@ -433,20 +586,20 @@ def _link_finding(
     domain = registrable_domain(host) if host else ""
     age = domain_age_days(domain) if (domain and check_link_domain_age) else None
     pwd = has_password_form(url) if check_password_form else False
-    warnings: list[str] = []
+    warnings: list[Warning] = []
     if check_link_domain_age and domain:
         if age is None:
-            warnings.append(f"young domain - age unknown for {domain} (treated as too young)")
+            warnings.append(YoungDomain(domain=domain, age_days=None))
         elif age < young_domain_days:
-            warnings.append(f"young domain - {age}d")
+            warnings.append(YoungDomain(domain=domain, age_days=age))
     if pwd:
-        warnings.append("form contains password input field")
+        warnings.append(PasswordForm(domain=domain))
     if check_password_form:
-        redirect_warning = _redirector_warning(url, host, domain)
-        if redirect_warning:
-            warnings.append(redirect_warning)
+        resolved = _redirector_final_domain(url, host, domain)
+        if resolved:
+            warnings.append(RedirectorResolves(domain=domain, final_domain=resolved))
     elif _is_known_redirector(host, domain):
-        warnings.append("redirector/tracking URL (not resolved — link fetch gated off)")
+        warnings.append(RedirectorResolves(domain=domain, final_domain=""))
     return LinkFinding(url, host, domain, age, pwd, warnings)
 
 
@@ -456,15 +609,19 @@ def _attach_message_warnings(
     body_text: str,
 ) -> None:
     msg = email.message_from_bytes(raw_rfc822, policy=policy.default)
-    warnings: list[str] = []
+    warnings: list[Warning] = []
     reply_to_domain = _header_address_domain(msg, "Reply-To")
     from_domain = _header_address_domain(msg, "From")
     if reply_to_domain and from_domain and reply_to_domain != from_domain:
-        warnings.append(f"reply-to domain {reply_to_domain} differs from from domain {from_domain}")
+        warnings.append(HeaderAnomaly(
+            f"reply-to domain {reply_to_domain} differs from from domain {from_domain}"
+        ))
 
     phrases = _pressure_phrases(str(msg.get("Subject", "")), body_text)
     if phrases:
-        warnings.append(f"time/payment pressure language: {', '.join(phrases)}")
+        warnings.append(HeaderAnomaly(
+            f"time/payment pressure language: {', '.join(phrases)}"
+        ))
 
     if warnings:
         findings.append(
@@ -554,28 +711,32 @@ def _attach_anchor_deception_warnings(
                 if final_domain == disp_domain:
                     continue  # shortener resolved to what the display promised
                 if final_domain and final_domain != href_domain:
-                    warning = (
-                        f"link text shows {disp_domain} but redirector resolves to "
-                        f"{final_domain}"
+                    warning = LinkTextMismatch(
+                        displayed=disp_domain,
+                        actual=final_domain,
+                        via_redirector=True,
                     )
                     target = findings_by_url.get(href)
                     if target is not None and warning not in target.warnings:
                         target.warnings.append(warning)
                     continue
-            warning = f"link text shows {disp_domain} but href points to {href_domain}"
+            warning = LinkTextMismatch(
+                displayed=disp_domain, actual=href_domain, via_redirector=False,
+            )
             target = findings_by_url.get(href)
             if target is not None and warning not in target.warnings:
                 target.warnings.append(warning)
 
 
-def _redirector_warning(url: str, host: str, domain: str) -> str:
+def _redirector_final_domain(url: str, host: str, domain: str) -> str:
+    """Resolve a known redirector to its final registrable domain, or "" if N/A."""
     if not _is_known_redirector(host, domain):
         return ""
     final = resolve_final_url(url)
     final_domain = registrable_domain(urlparse(final).hostname or "")
     if not final_domain or final_domain == domain:
         return ""
-    return f"redirector/tracking URL resolves to {final_domain}"
+    return final_domain
 
 
 def _is_known_redirector(host: str, domain: str) -> bool:
@@ -786,7 +947,7 @@ def annotate_html(html: str, findings: list[LinkFinding]) -> str:
             "span",
             attrs={"style": "color:#c00; font-weight:bold; font-size:90%;"},
         )
-        marker.string = f" [WARNING: {'; '.join(finding.warnings)}]"
+        marker.string = f" [WARNING: {'; '.join(str(w) for w in finding.warnings)}]"
         a.insert_after(marker)
     return str(soup)
 
@@ -800,6 +961,6 @@ def annotate(text: str, findings: list[LinkFinding]) -> str:
     for f in findings:
         if not f.warnings:
             continue
-        tag = f" [WARNING: {'; '.join(f.warnings)}]"
+        tag = f" [WARNING: {'; '.join(str(w) for w in f.warnings)}]"
         out = out.replace(f.url, f.url + tag, 1)
     return out

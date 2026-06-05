@@ -9,11 +9,14 @@ Usage:
     python -m tfatp.cli.diff_message <message-id>
     python -m tfatp.cli.diff_message <message-id> --as alice@example.com  # DWD only
 
+The diff is always shown when an original.eml is present; the exit code reflects
+DKIM trust so scripts can gate on it.
+
 Exit codes:
-    0 — diff produced (or no body difference)
+    0 — diff produced, DKIM on original.eml passed
     1 — message exists but was not processed by tfatp
     2 — processed but the embedded original.eml is missing / unreadable
-    3 — original.eml present but DKIM did not pass
+    3 — diff produced, but DKIM on original.eml did not pass (untrusted)
 """
 
 import argparse
@@ -93,7 +96,9 @@ def main(argv: list[str]) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="\n".join(__doc__.splitlines()[2:]),
     )
-    p.add_argument("message_id", help="Gmail message id (hex form, as the watcher prints).")
+    p.add_argument("message_id",
+                   help="Gmail hex id (as the watcher prints) or RFC 822 Message-ID "
+                        "(e.g. <abc@mail.gmail.com>, with or without angle brackets).")
     p.add_argument("--as", dest="subject", default=None,
                    help="Impersonate this user (service_account / DWD only).")
     p.add_argument("--config", default="config.toml", help="Path to config.toml.")
@@ -105,12 +110,19 @@ def main(argv: list[str]) -> int:
         else GmailClient(cfg)
     )
 
-    raw = client.get_raw_message(args.message_id)
+    try:
+        message_id = client.resolve_message_id(args.message_id)
+    except LookupError as exc:
+        print(f"ERROR — {exc}")
+        return 1
+    if message_id != args.message_id:
+        print(f"resolved Message-ID → hex id {message_id}")
+    raw = client.get_raw_message(message_id)
     current = email.message_from_bytes(raw, policy=policy.default)
 
     checked_by = (current.get(loop_guard.HEADER_CHECKED_BY, "") or "").strip().lower()
     if checked_by != loop_guard.X_CHECKED_BY:
-        print(f"NOT PROCESSED — message {args.message_id} has no "
+        print(f"NOT PROCESSED — message {message_id} has no "
               f"'{loop_guard.HEADER_CHECKED_BY}: {loop_guard.X_CHECKED_BY}' header.")
         return 1
     print(f"processed by tfatp — {loop_guard.HEADER_CHECKED_BY}: {checked_by}")
@@ -130,8 +142,7 @@ def main(argv: list[str]) -> int:
     dkim_res = verify_dkim(original_bytes)
     print(f"DKIM on original: {dkim_res.status} ({dkim_res.detail})")
     if not dkim_res.ok:
-        print("STOPPING — original.eml DKIM did not pass; diff would be untrustworthy.")
-        return 3
+        print("WARNING — DKIM on original.eml did not pass; diff below is UNTRUSTED.")
 
     original = email.message_from_bytes(original_bytes, policy=policy.default)
     stripped_current = _strip_original_attachment(raw)
@@ -162,7 +173,7 @@ def main(argv: list[str]) -> int:
         sys.stdout.writelines(diff)
         if diff and not diff[-1].endswith("\n"):
             print()
-    return 0
+    return 0 if dkim_res.ok else 3
 
 
 if __name__ == "__main__":

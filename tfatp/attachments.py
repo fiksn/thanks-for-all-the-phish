@@ -16,7 +16,7 @@ from email import policy
 
 import olefile
 
-from tfatp.link_analysis import LinkFinding
+from tfatp.link_analysis import AttachmentIssue, LinkFinding
 
 _OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
@@ -100,14 +100,14 @@ def _ole_macro_status(payload: bytes) -> str:
         ole.close()
 
 
-def _finding(name: str, warning: str) -> LinkFinding:
+def _finding(name: str, kind: str, detail: str) -> LinkFinding:
     return LinkFinding(
         url=f"attachment:{name}",
         host="",
         domain="",
         age_days=None,
         has_password_form=False,
-        warnings=[warning],
+        warnings=[AttachmentIssue(name=name, kind=kind, detail=detail)],
     )
 
 
@@ -124,7 +124,7 @@ def scan(raw: bytes) -> list[LinkFinding]:
             size = len(payload)
             if size > _MAX_ATTACHMENT_BYTES:
                 findings.append(_finding(
-                    name,
+                    name, "oversized",
                     f"attachment too large to scan: {size} bytes "
                     f"(max {_MAX_ATTACHMENT_BYTES})",
                 ))
@@ -132,21 +132,25 @@ def scan(raw: bytes) -> list[LinkFinding]:
             ooxml = _ooxml_macro_status(payload)
             ole = _ole_macro_status(payload)
             if ooxml == "macro" or ole == "macro":
-                findings.append(_finding(name, f"attachment contains VBA macro ({name})"))
+                findings.append(_finding(name, "macro", "attachment contains VBA macro"))
             elif ooxml == "bomb":
                 findings.append(_finding(
-                    name, f"attachment looks like a zip bomb: structure exceeds caps ({name})"
+                    name, "bomb",
+                    "attachment looks like a zip bomb: structure exceeds caps",
                 ))
             elif ooxml == "encrypted":
                 findings.append(_finding(
-                    name, f"attachment encrypted (cannot scan for macros) ({name})"
+                    name, "encrypted",
+                    "attachment encrypted (cannot scan for macros)",
                 ))
             elif ooxml == "unreadable" or ole == "unreadable":
                 findings.append(_finding(
-                    name, f"attachment unreadable: structure could not be parsed ({name})"
+                    name, "unreadable",
+                    "attachment unreadable: structure could not be parsed",
                 ))
         except Exception as exc:  # noqa: BLE001 — last-resort isolation per attachment
             findings.append(_finding(
-                name, f"attachment scan failed: {type(exc).__name__} ({name})"
+                name, "scan_failed",
+                f"attachment scan failed: {type(exc).__name__}",
             ))
     return findings

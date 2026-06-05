@@ -91,7 +91,11 @@ def maybe_rewrite_new_mail(
     if smtp_result is not None:
         _phase("smtp_verify", f"{smtp_result.status} ({smtp_result.detail})")
     if enabled["check_link_domain_age"] or enabled["check_link_lookalike"]:
-        link_warns = sum(1 for f in findings for w in f.warnings if "link" in w or "young" in w)
+        from tfatp.link_analysis import LinkLookalike, LinkTextMismatch, YoungDomain
+        link_warns = sum(
+            1 for f in findings for w in f.warnings
+            if isinstance(w, (YoungDomain, LinkLookalike, LinkTextMismatch))
+        )
         _phase(
             "link_checks",
             f"{len(findings)} link(s), {link_warns} warning(s)",

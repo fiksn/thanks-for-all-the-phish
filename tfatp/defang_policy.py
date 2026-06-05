@@ -12,7 +12,15 @@ the same as "all" — the only meaningful distinction is on/off.
 
 from dataclasses import dataclass, fields
 
-from tfatp.link_analysis import LinkFinding
+from tfatp.link_analysis import (
+    AttachmentIssue,
+    LinkFinding,
+    LinkLookalike,
+    LinkTextMismatch,
+    PasswordForm,
+    SenderDomainAge,
+    YoungDomain,
+)
 from tfatp.lookalike import LookalikeResult
 from tfatp.smtp_verify import SmtpVerifyResult
 
@@ -55,18 +63,19 @@ def _triggers_for(f: LinkFinding, policy: DefangPolicy) -> list[Action]:
     """Return the policy actions activated by each warning on this finding."""
     actions: list[Action] = []
     for w in f.warnings:
-        if "password" in w and policy.on_password_form != "no":
+        if isinstance(w, PasswordForm) and policy.on_password_form != "no":
             actions.append(policy.on_password_form)
-        if "sender domain age" in w and policy.on_sender_young_domain != "no":
+        elif isinstance(w, SenderDomainAge) and policy.on_sender_young_domain != "no":
             actions.append(policy.on_sender_young_domain)
-        elif "young domain" in w and policy.on_young_domain != "no":
+        elif isinstance(w, YoungDomain) and policy.on_young_domain != "no":
             actions.append(policy.on_young_domain)
-        if "link domain lookalike" in w and policy.on_link_lookalike != "no":
+        elif isinstance(w, LinkLookalike) and policy.on_link_lookalike != "no":
             actions.append(policy.on_link_lookalike)
-        if "link text shows" in w and policy.on_anchor_deception != "no":
+        elif isinstance(w, LinkTextMismatch) and policy.on_anchor_deception != "no":
             actions.append(policy.on_anchor_deception)
-        if (
-            ("VBA macro" in w or "zip bomb" in w or "encrypted (cannot scan" in w)
+        elif (
+            isinstance(w, AttachmentIssue)
+            and w.kind in {"macro", "bomb", "encrypted"}
             and policy.on_macro != "no"
         ):
             actions.append(policy.on_macro)

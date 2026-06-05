@@ -2,7 +2,12 @@ import contextlib
 from collections.abc import Iterator
 
 from tfatp import link_analysis, smtp_verify
-from tfatp.link_analysis import _MAX_LINK_RESPONSE_BYTES
+from tfatp.link_analysis import (
+    HeaderAnomaly,
+    LinkTextMismatch,
+    RedirectorResolves,
+    _MAX_LINK_RESPONSE_BYTES,
+)
 
 
 class _Response:
@@ -98,7 +103,7 @@ def test_analyze_flags_reply_to_domain_mismatch():
 
     assert findings[-1].url == "message:headers"
     assert findings[-1].warnings == [
-        "reply-to domain vendor-payments.com differs from from domain vendor.com"
+        HeaderAnomaly("reply-to domain vendor-payments.com differs from from domain vendor.com")
     ]
 
 
@@ -131,8 +136,10 @@ def test_analyze_flags_time_and_payment_pressure_language():
 
     assert findings[-1].url == "message:headers"
     assert findings[-1].warnings == [
-        "time/payment pressure language: final notice, payment overdue, "
-        "wire transfer, within 24 hours, bank details changed"
+        HeaderAnomaly(
+            "time/payment pressure language: final notice, payment overdue, "
+            "wire transfer, within 24 hours, bank details changed"
+        )
     ]
 
 
@@ -150,7 +157,9 @@ def test_analyze_flags_direct_redirector_chain(monkeypatch):
     )
 
     assert findings[0].warnings == [
-        "redirector/tracking URL resolves to credential-capture.com"
+        RedirectorResolves(
+            domain=findings[0].domain, final_domain="credential-capture.com",
+        )
     ]
 
 
@@ -178,8 +187,14 @@ def test_anchor_deception_uses_redirector_final_domain(monkeypatch):
     findings = link_analysis.analyze(body, raw_rfc822=raw)
 
     assert findings[1].warnings == [
-        "redirector/tracking URL resolves to credential-capture.com",
-        "link text shows example.com but redirector resolves to credential-capture.com",
+        RedirectorResolves(
+            domain=findings[1].domain, final_domain="credential-capture.com",
+        ),
+        LinkTextMismatch(
+            displayed="example.com",
+            actual="credential-capture.com",
+            via_redirector=True,
+        ),
     ]
 
 
@@ -210,7 +225,7 @@ def test_attachment_scan_flags_ooxml_with_vba_project():
     raw = _eml_with_attachment("doc.docm", buf.getvalue())
     findings = _attachments.scan(raw)
     assert len(findings) == 1
-    assert "VBA macro" in findings[0].warnings[0]
+    assert "VBA macro" in str(findings[0].warnings[0])
 
 
 def test_attachment_scan_skips_oversized_payload(monkeypatch):
@@ -218,7 +233,7 @@ def test_attachment_scan_skips_oversized_payload(monkeypatch):
     raw = _eml_with_attachment("big.bin", b"A" * 200)
     findings = _attachments.scan(raw)
     assert len(findings) == 1
-    assert "too large to scan" in findings[0].warnings[0]
+    assert "too large to scan" in str(findings[0].warnings[0])
 
 
 def test_attachment_scan_caps_zip_entry_count(monkeypatch):
@@ -230,7 +245,7 @@ def test_attachment_scan_caps_zip_entry_count(monkeypatch):
     raw = _eml_with_attachment("many.zip", buf.getvalue(), subtype="zip")
     findings = _attachments.scan(raw)
     assert len(findings) == 1
-    assert "zip bomb" in findings[0].warnings[0]
+    assert "zip bomb" in str(findings[0].warnings[0])
 
 
 def test_attachment_scan_flags_zip_compression_bomb(monkeypatch):
@@ -241,7 +256,7 @@ def test_attachment_scan_flags_zip_compression_bomb(monkeypatch):
     raw = _eml_with_attachment("bomb.zip", buf.getvalue(), subtype="zip")
     findings = _attachments.scan(raw)
     assert len(findings) == 1
-    assert "zip bomb" in findings[0].warnings[0]
+    assert "zip bomb" in str(findings[0].warnings[0])
 
 
 def test_attachment_scan_flags_zip_declared_size_bomb(monkeypatch):
@@ -252,7 +267,7 @@ def test_attachment_scan_flags_zip_declared_size_bomb(monkeypatch):
     raw = _eml_with_attachment("big.zip", buf.getvalue(), subtype="zip")
     findings = _attachments.scan(raw)
     assert len(findings) == 1
-    assert "zip bomb" in findings[0].warnings[0]
+    assert "zip bomb" in str(findings[0].warnings[0])
 
 
 def test_attachment_scan_flags_encrypted_zip():
@@ -275,7 +290,7 @@ def test_attachment_scan_flags_encrypted_zip():
     raw = _eml_with_attachment("locked.zip", bytes(data), subtype="zip")
     findings = _attachments.scan(raw)
     assert len(findings) == 1
-    assert "encrypted" in findings[0].warnings[0]
+    assert "encrypted" in str(findings[0].warnings[0])
 
 
 def test_attachment_scan_does_not_crash_on_garbage_payload():
