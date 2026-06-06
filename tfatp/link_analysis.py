@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from email import policy
 from email.utils import getaddresses, parsedate_to_datetime
 from functools import lru_cache
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urlunparse
 
 import drawbridge
 import drawbridge.sync
@@ -101,7 +101,8 @@ class LinkLookalike:
     distance: int
 
     def __str__(self) -> str:
-        return f"lookalike of {self.target} (distance {self.distance})"
+        from tfatp.lookalike import describe
+        return describe(self.domain, self.target, self.distance)
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,11 +159,11 @@ class SenderDomainAge:
     def __str__(self) -> str:
         if self.age_days is None:
             return (
-                f"sender domain age unknown for {self.domain} "
+                f"Sender domain age unknown for {self.domain} "
                 f"(treated as too young)"
             )
         return (
-            f"sender domain age {self.age_days}d < {self.min_required}d "
+            f"Sender domain age {self.age_days}d < {self.min_required}d "
             f"for {self.domain}"
         )
 
@@ -824,24 +825,62 @@ def message_body_text(raw_rfc822: bytes, reveal_hrefs: bool = True) -> str:
     return "\n".join(html_to_text(h, reveal_hrefs=reveal_hrefs) for h in html)
 
 
-_DEFANG = {
-    "http://": "hxxp://",
-    "https://": "hxxps://",
-    "ftp://": "fxp://",
-    "ftps://": "fxps://",
-    "sftp://": "sxftp://",
-}
+# Suffix appended to a URL's hostname to neutralise it. ``.invalid`` is
+# reserved by RFC 6761 so no real DNS resolver can ever map it to an
+# address — clicking the rewritten link yields a DNS failure instead of
+# reaching the attacker's host. The leading dot keeps the original
+# hostname as a clearly visible label inside the new name, so the
+# recipient can read what was meant to be reached and, if they choose,
+# strip the suffix back off to navigate. Configurable via
+# ``defang_url_suffix`` in config.toml.
+_DEFAULT_DEFANG_SUFFIX = ".REMOVE-TO-VISIT.invalid"
+
+_DEFANGABLE_SCHEMES = ("http://", "https://", "ftp://", "ftps://", "sftp://")
 
 
-def defang(text: str) -> str:
-    """Replace URL scheme separators so most terminals stop auto-linking them."""
-    out = text
-    for src, dst in _DEFANG.items():
-        out = out.replace(src, dst)
-    return out
+def defang(text: str, suffix: str = _DEFAULT_DEFANG_SUFFIX) -> str:
+    """Neutralise URLs in `text` by appending `suffix` to each hostname.
+
+    The scheme is left intact (``https://`` stays ``https://``) so email
+    clients with strict URL allowlists — Gmail, OWA — keep treating the
+    anchor as a real link. The hostname is the part we mangle: a default
+    suffix of ``.REMOVE-TO-VISIT.invalid`` guarantees DNS failure, and the
+    recipient can see what the original hostname was just by reading the
+    URL. Pass a different `suffix` (e.g. ``.example``) to customise.
+    """
+    return _LINK_RE.sub(lambda m: _defang_one(m.group(1), suffix), text)
 
 
-def defang_html(html: str, urls_to_defang: set[str], neutralize_all: bool) -> str:
+def _defang_one(url: str, suffix: str) -> str:
+    """Append `suffix` to the hostname inside `url`, preserving the rest."""
+    # `_LINK_RE` may have swept up trailing punctuation that's not really
+    # part of the URL (e.g. ``https://x.com.`` at the end of a sentence).
+    # Strip it for parsing, re-attach after, so we don't double-up dots.
+    trailing = ""
+    while url and url[-1] in _TRAILING_PUNCT:
+        trailing = url[-1] + trailing
+        url = url[:-1]
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    if not host:
+        return url + trailing
+    auth = ""
+    if parsed.username is not None:
+        auth = parsed.username
+        if parsed.password is not None:
+            auth += f":{parsed.password}"
+        auth += "@"
+    port = f":{parsed.port}" if parsed.port else ""
+    new_netloc = f"{auth}{host}{suffix}{port}"
+    return urlunparse(parsed._replace(netloc=new_netloc)) + trailing
+
+
+def defang_html(
+    html: str,
+    urls_to_defang: set[str],
+    neutralize_all: bool,
+    suffix: str = _DEFAULT_DEFANG_SUFFIX,
+) -> str:
     """Defang URLs in an HTML body while preserving structure.
 
     Two vectors get neutralized:
@@ -864,8 +903,20 @@ def defang_html(html: str, urls_to_defang: set[str], neutralize_all: bool) -> st
         return neutralize_all or u in urls_to_defang
 
     for a in soup.find_all("a", href=True):
-        if hit(_normalize_href(a["href"])):
-            a["href"] = defang(a["href"])
+        href = a["href"]
+        # Only act on web-scheme anchors. mailto:, tel:, javascript:, and
+        # in-document fragments don't fit the defang model — touching them
+        # mangles email addresses rendered as `<a href="mailto:…">…</a>`
+        # and tooltip-style links the sender styled themselves.
+        if not href.lower().startswith(_DEFANGABLE_SCHEMES):
+            continue
+        if hit(_normalize_href(href)):
+            a["href"] = _defang_one(href, suffix)
+            # Anchor contents (button text, inline image, styled span) are
+            # left intact so the recipient sees the original layout. The
+            # rewritten href still has the original scheme (so Gmail's
+            # sanitizer keeps the anchor clickable) but resolves to an
+            # ``.invalid`` host that will never connect anywhere.
     # Visible-text URLs. Walk text nodes once; skip script/style which can
     # contain URL-shaped tokens that aren't meant to be clicked.
     for txt in list(soup.find_all(string=True)):
@@ -875,11 +926,11 @@ def defang_html(html: str, urls_to_defang: set[str], neutralize_all: bool) -> st
         if "://" not in original:
             continue
         if neutralize_all:
-            replaced = defang(original)
+            replaced = defang(original, suffix)
         else:
             replaced = original
             for u in urls_to_defang:
-                replaced = replaced.replace(u, defang(u))
+                replaced = replaced.replace(u, _defang_one(u, suffix))
         if replaced != original:
             txt.replace_with(replaced)
     return str(soup)
@@ -935,19 +986,39 @@ def neutralize_tracking_pixels(html: str) -> tuple[str, int]:
 
 
 def annotate_html(html: str, findings: list[LinkFinding]) -> str:
-    """Insert a red warning marker after each `<a>` whose href appears in
-    `findings` with attached warnings. Leaves the anchor itself untouched."""
+    """Append a ⚠ tooltip span after each `<a>` whose href is in `findings`.
+
+    The anchor itself is left strictly untouched — no attribute, content, or
+    style change — so the sender's button captions, existing tooltips, and
+    layout survive verbatim. The warning lives on a sibling ``<span>⚠</span>``
+    inserted directly after the anchor; its ``title`` attribute carries the
+    original href plus the warning text. On Gmail web, OWA, Apple Mail, and
+    Thunderbird the recipient sees the small red triangle and can hover it
+    for the tooltip. Mobile clients have no hover surface, but the icon is
+    still a visible "this link was flagged" cue.
+
+    Plain text bodies still get the inline ``[WARNING: ...]`` marker — see
+    :func:`annotate` — because text has no DOM to attach a sibling to.
+    """
     soup = _parse_html(html)
     by_url = {f.url: f for f in findings if f.warnings}
     for a in soup.find_all("a", href=True):
-        finding = by_url.get(_normalize_href(a["href"]))
+        href = _normalize_href(a["href"])
+        finding = by_url.get(href)
         if finding is None:
             continue
+        message = (
+            f"{href} WARNING: "
+            + "; ".join(str(w) for w in finding.warnings)
+        )
         marker = soup.new_tag(
             "span",
-            attrs={"style": "color:#c00; font-weight:bold; font-size:90%;"},
+            attrs={
+                "title": message,
+                "style": "color:#c00; font-weight:bold; margin-left:2px;",
+            },
         )
-        marker.string = f" [WARNING: {'; '.join(str(w) for w in finding.warnings)}]"
+        marker.string = "⚠"
         a.insert_after(marker)
     return str(soup)
 

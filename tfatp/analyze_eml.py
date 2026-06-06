@@ -23,7 +23,7 @@ from email.message import EmailMessage
 from tfatp import loop_guard
 from tfatp.attachments import scan as scan_attachments
 from tfatp.config import _DEFAULT_CHECK_PHASES, _DEFAULT_CHECK_PHASES_INTERNAL
-from tfatp.dkim_verify import verify as verify_dkim
+from tfatp.dkim_verify import DkimResult, verify as verify_dkim
 from tfatp.link_analysis import (
     DEFAULT_YOUNG_DOMAIN_DAYS,
     LinkFinding,
@@ -54,11 +54,13 @@ X_CHECKED_BY = loop_guard.X_CHECKED_BY
 # Content-Type, Content-Transfer-Encoding, etc. must be rewritten because the
 # body changes; everything else (From/To/Subject/Date/Message-ID/References/...)
 # is preserved verbatim so threading and identity stay intact.
-def _defang_subject_urls(subject: str) -> str:
-    from tfatp.link_analysis import defang, extract_links
+def _defang_subject_urls(subject: str, suffix: str | None = None) -> str:
+    from tfatp.link_analysis import _DEFAULT_DEFANG_SUFFIX, defang, extract_links
+    if suffix is None:
+        suffix = _DEFAULT_DEFANG_SUFFIX
     out = subject
     for url in extract_links(subject):
-        out = out.replace(url, defang(url))
+        out = out.replace(url, defang(url, suffix))
     return out
 
 
@@ -82,19 +84,16 @@ def _banner_lines(
     sender_lookalike: LookalikeResult | None,
     findings: list[LinkFinding],
     neutralize_all: bool,
-) -> tuple[list[str], list[str]]:
-    """Build banner content as (top_lines, warning_lines).
+    dkim_result: "DkimResult | None" = None,
+) -> list[str]:
+    """Build the banner's bullet list — one flat sequence of warning sentences.
 
-    DKIM is intentionally not surfaced: the signature belongs to the original
-    (attached) bytes and a reader can re-verify it independently.
+    DKIM is shown display-only: a failed or absent signature is informational
+    context for the recipient, never an input to scoring, gating, or defang
+    decisions (see [[feedback_dkim_no_scoring]]). Sender-level findings
+    (impersonation, SMTP probe) sit at the same level as link-level findings;
+    there is no separate "top" group.
     """
-    top: list[str] = []
-    if sender_lookalike is not None and sender_lookalike.matched:
-        top.append(f"Sender impersonation: {sender_lookalike.detail}")
-    if smtp_result is not None:
-        suffix = " — all links defanged below" if neutralize_all else ""
-        top.append(f"SMTP: {smtp_result.status} ({smtp_result.detail}){suffix}")
-
     young_known: dict[str, int] = {}        # domain -> youngest age seen
     young_unknown: set[str] = set()
     lookalike_targets: dict[str, set[str]] = {}  # target -> impersonating domains
@@ -104,7 +103,6 @@ def _banner_lines(
     link_text_mismatch: set[str] = set()    # rendered per-link sentence
     sender_notes: list[str] = []
     other: list[str] = []                   # attachments, header anomalies, fallbacks
-    defanged_cascade: set[str] = set()
 
     for f in findings:
         for w in f.warnings:
@@ -129,38 +127,39 @@ def _banner_lines(
                 # AttachmentIssue, HeaderAnomaly — no domain to aggregate on.
                 other.append(str(w))
 
-    # When defang escalates to the whole body, surface the domains that got
-    # neutralised even when their per-link check produced no warning of its own —
-    # otherwise the recipient sees hxxps:// everywhere with no explanation.
-    if neutralize_all:
-        for f in findings:
-            if not f.warnings and f.url and "://" in f.url:
-                defanged_cascade.add(f.domain or f.host or "(unknown)")
-
-    warnings: list[str] = list(sender_notes)
+    lines: list[str] = []
+    if dkim_result is not None and dkim_result.status != "pass":
+        if dkim_result.status == "none":
+            lines.append("DKIM: no signature on the message")
+        elif dkim_result.status == "fail":
+            lines.append(f"DKIM: signature verification failed ({dkim_result.detail})")
+        else:  # "error"
+            lines.append(f"DKIM: verification error ({dkim_result.detail})")
+    if sender_lookalike is not None and sender_lookalike.matched:
+        lines.append(f"Sender impersonation: {sender_lookalike.detail}")
+    if smtp_result is not None:
+        lines.append(f"SMTP: {smtp_result.status} ({smtp_result.detail})")
+    lines.extend(sender_notes)
     if young_known or young_unknown:
         parts = [f"{d} ({age}d)" for d, age in sorted(young_known.items())]
         parts += [f"{d} (age unknown)" for d in sorted(young_unknown)]
-        warnings.append("Young domains: " + ", ".join(parts))
+        lines.append("Links to young domains: " + ", ".join(parts))
     for target in sorted(lookalike_targets):
         doms = ", ".join(sorted(lookalike_targets[target]))
-        warnings.append(f"Domains impersonating {target}: {doms}")
+        lines.append(f"Links to domains impersonating {target}: {doms}")
     if password:
-        warnings.append("Password form at: " + ", ".join(sorted(password)))
+        lines.append("Links to password forms at: " + ", ".join(sorted(password)))
     if redirector:
         parts = [
             f"{src} → {redirector[src]}" if redirector[src] else src
             for src in sorted(redirector)
         ]
-        warnings.append("Redirector/tracking links: " + ", ".join(parts))
+        lines.append("Redirector/tracking links: " + ", ".join(parts))
     if subject_urls:
-        warnings.append("URLs in Subject from: " + ", ".join(sorted(subject_urls)))
-    warnings.extend(sorted(link_text_mismatch))
-    warnings.extend(other)
-    if defanged_cascade:
-        warnings.append("Defanged (gate tripped earlier): "
-                        + ", ".join(sorted(defanged_cascade)))
-    return top, warnings
+        lines.append("URLs in Subject from: " + ", ".join(sorted(subject_urls)))
+    lines.extend(sorted(link_text_mismatch))
+    lines.extend(other)
+    return lines
 
 
 def _banner(
@@ -168,21 +167,19 @@ def _banner(
     sender_lookalike: LookalikeResult | None,
     findings: list[LinkFinding],
     neutralize_all: bool = False,
+    dkim_result: DkimResult | None = None,
 ) -> str:
-    top, warnings = _banner_lines(smtp_result, sender_lookalike, findings, neutralize_all)
-    if not top and not warnings:
+    lines = _banner_lines(
+        smtp_result, sender_lookalike, findings, neutralize_all,
+        dkim_result=dkim_result,
+    )
+    if not lines:
         return ""
-    lines = ["=== thanks-for-all-the-phish analysis ==="]
-    lines.extend(top)
-    if warnings:
-        lines.append("Warnings:")
-        lines.extend(f"  - {w}" for w in warnings)
-    else:
-        lines.append("Warnings: none")
-    lines.append("=== end analysis ===")
-    lines.append("")
-    lines.append("")
-    return "\n".join(lines)
+    out = ["WARNING:"]
+    out.extend(f"  - {w}" for w in lines)
+    out.append("")
+    out.append("")
+    return "\n".join(out)
 
 
 def _banner_html(
@@ -190,27 +187,24 @@ def _banner_html(
     sender_lookalike: LookalikeResult | None,
     findings: list[LinkFinding],
     neutralize_all: bool = False,
+    dkim_result: DkimResult | None = None,
 ) -> str:
     import html as _html
-    top, warnings = _banner_lines(smtp_result, sender_lookalike, findings, neutralize_all)
-    if not top and not warnings:
+    lines = _banner_lines(
+        smtp_result, sender_lookalike, findings, neutralize_all,
+        dkim_result=dkim_result,
+    )
+    if not lines:
         return ""
     parts = [
         '<div style="border:2px solid #c00; background:#fff5f5; padding:12px; '
         'margin:0 0 16px 0; font-family:Roboto,Arial,Helvetica,sans-serif; '
         'font-size:14px; color:#222;">',
-        '<div style="font-weight:bold; color:#c00;">'
-        '=== thanks-for-all-the-phish analysis ===</div>',
+        '<div style="font-weight:bold; color:#c00;">WARNING:</div>',
+        '<ul style="margin:4px 0 0 0;">',
     ]
-    for line in top:
-        parts.append(f'<div>{_html.escape(line)}</div>')
-    if warnings:
-        parts.append('<div style="margin-top:6px;">Warnings:</div><ul style="margin:4px 0 0 0;">')
-        for w in warnings:
-            parts.append(f'<li>{_html.escape(w)}</li>')
-        parts.append('</ul>')
-    else:
-        parts.append('<div>Warnings: none</div>')
+    parts.extend(f'<li>{_html.escape(w)}</li>' for w in lines)
+    parts.append('</ul>')
     parts.append('</div>')
     return "".join(parts)
 
@@ -226,6 +220,8 @@ def build_corrected_eml(
     body_subtype: str = "plain",
     external_warning_text: str = "",
     external_warning_html: str = "",
+    defang_suffix: str | None = None,
+    dkim_result: DkimResult | None = None,
 ) -> bytes:
     # DKIM is deliberately not propagated into the rewritten message — the
     # signature applies to the original (attached) bytes; recomputing it on
@@ -240,7 +236,7 @@ def build_corrected_eml(
         if k.lower() == "subject":
             # Defang any URL that appears in the Subject so a recipient client
             # that auto-linkifies subject text can't follow it directly.
-            v = _defang_subject_urls(str(v))
+            v = _defang_subject_urls(str(v), defang_suffix)
         new_msg[k] = v
 
     new_msg[loop_guard.HEADER_CHECKED_BY] = X_CHECKED_BY
@@ -262,11 +258,17 @@ def build_corrected_eml(
     external_triggered = bool(external_warning_text or external_warning_html)
     if body_subtype == "html":
         intro = external_warning_html or ""
-        analysis_banner = _banner_html(smtp_result, sender_lookalike, findings, neutralize_all)
+        analysis_banner = _banner_html(
+            smtp_result, sender_lookalike, findings, neutralize_all,
+            dkim_result=dkim_result,
+        )
         new_msg.set_content(intro + analysis_banner + annotated_body, subtype="html")
     else:
         intro = f"{external_warning_text}\n\n" if external_warning_text else ""
-        analysis_banner = _banner(smtp_result, sender_lookalike, findings, neutralize_all)
+        analysis_banner = _banner(
+            smtp_result, sender_lookalike, findings, neutralize_all,
+            dkim_result=dkim_result,
+        )
         new_msg.set_content(intro + analysis_banner + annotated_body)
     if external_triggered:
         new_msg["X-Checked-External-Sender"] = "yes"
@@ -289,17 +291,22 @@ def rewrite_body(
     findings: list[LinkFinding],
     neutralize_all: bool,
     per_url: set[str],
+    defang_suffix: str | None = None,
 ) -> str:
     """Annotate + defang the body, preserving the input subtype.
 
-    Plain text keeps the existing `[WARNING: ...]` inline tags and scheme
-    substitution. HTML keeps the original tree and mutates href/src/visible
-    URLs in place so the result still renders like the original phish — just
-    no longer clickable.
+    Plain text keeps the existing `[WARNING: ...]` inline tags and host
+    suffixing. HTML keeps the original tree and mutates href/visible URLs
+    in place so the result still renders like the original phish — just
+    pointed at an ``.invalid`` host that never resolves.
     """
+    from tfatp.link_analysis import _DEFAULT_DEFANG_SUFFIX
+    suffix = defang_suffix if defang_suffix is not None else _DEFAULT_DEFANG_SUFFIX
     if subtype == "html":
         annotated = annotate_html(body, findings)
-        annotated = defang_html(annotated, per_url, neutralize_all=neutralize_all)
+        annotated = defang_html(
+            annotated, per_url, neutralize_all=neutralize_all, suffix=suffix,
+        )
         # Tracking-pixel neutralization runs unconditionally on the rewrite
         # path: by the time we get here the message has already been flagged,
         # so there's no legitimate reason to let it phone home on open.
@@ -307,10 +314,10 @@ def rewrite_body(
         return annotated
     annotated = annotate(body, findings)
     if neutralize_all:
-        return defang(annotated)
+        return defang(annotated, suffix)
     out = annotated
     for url in per_url:
-        out = out.replace(url, defang(url))
+        out = out.replace(url, defang(url, suffix))
     return out
 
 
@@ -450,21 +457,36 @@ def analyze_with_gate(
             gate_failed = True
 
     def _apply_link_lookalike(items: list[LinkFinding]) -> None:
-        if not (enabled["check_link_lookalike"] and protected_domain):
+        if not enabled["check_link_lookalike"]:
+            return
+        # Mirror sender_lookalike: check against every workspace domain plus
+        # the receiver's mailbox domain, not just the mailbox. A link
+        # impersonating a sibling org domain is just as suspicious as one
+        # impersonating the receiver's own.
+        targets = {d for d in org_domains if d} | (
+            {protected_domain} if protected_domain else set()
+        )
+        if not targets:
             return
         for item in items:
             if not item.domain or item.url.startswith("sender:"):
                 continue
-            res = check_lookalike(
-                item.domain, protected_domain,
-                max_distance=sender_lookalike_max_distance,
-            )
-            if res.matched:
-                item.warnings.append(LinkLookalike(
-                    domain=item.domain,
-                    target=protected_domain,
-                    distance=res.distance,
-                ))
+            # Skip identity — a link to the mailbox's own domain isn't a
+            # lookalike. The check_lookalike short-circuit handles this
+            # for the exact-match case; we exclude the domain from the
+            # target set so it can't match itself with distance 0.
+            candidate_targets = targets - {item.domain}
+            for target in sorted(candidate_targets):
+                res = check_lookalike(
+                    item.domain, target,
+                    max_distance=sender_lookalike_max_distance,
+                )
+                if res.matched:
+                    item.warnings.append(LinkLookalike(
+                        domain=item.domain,
+                        target=target,
+                        distance=res.distance,
+                    ))
 
     # Per-phase model for link stages: only fetch URLs (check_password_form)
     # if it sits in a strictly later phase than the link-data checks AND no
@@ -515,6 +537,20 @@ def analyze_with_gate(
                 check_password_form=True,
             )
             _apply_link_lookalike(findings)
+    # PasswordForm on its own — i.e. a credential prompt on a link with no
+    # other suspicious signal — is too noisy to surface. Legitimate auth
+    # providers (Google, Microsoft, your IdP) all expose password fields on
+    # routine notification links, so flagging every sign-in form generates
+    # ⚠ icons on benign mail. Keep the warning only when something else on
+    # the *same* finding also fired: young domain, link lookalike, anchor
+    # deception, or redirector resolution mismatch. Phishing kits on a
+    # mature, non-lookalike registrable still escape this filter — that's
+    # the trade-off — but the realistic alternative is whitelist whack-a-
+    # mole on every benign provider.
+    for f in findings:
+        if len(f.warnings) == 1 and isinstance(f.warnings[0], PasswordForm):
+            f.warnings.clear()
+
     # Attachment scanning is always-on: local-only, fast, and a macro is a
     # high-confidence malicious signal that should reach the defang pipeline
     # the same way link warnings do.
@@ -638,6 +674,7 @@ def run(raw: bytes, young_domain_days: int, quiet: bool,
         body_subtype=body_subtype,
         external_warning_text=intro_text,
         external_warning_html=intro_html,
+        dkim_result=dkim_result,
     )
     sys.stdout.buffer.write(corrected)
 

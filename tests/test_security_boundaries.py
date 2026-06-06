@@ -348,6 +348,33 @@ def test_lookalike_does_not_match_unrelated_idn():
     assert not res.matched
 
 
+def test_lookalike_charges_www_prefix_as_one_edit():
+    # `www-acme.io` would otherwise be 4 raw edits from `acme.io`. Charging
+    # the glued-in `www-` as a single edit brings it back within threshold.
+    res = _check_lookalike("www-acme.io", "acme.io", max_distance=1)
+    assert res.matched
+    assert res.distance == 1
+
+
+def test_lookalike_detail_tld_swap_phrasing():
+    res = _check_lookalike("acme.io", "acme.com", max_distance=1)
+    assert res.matched
+    assert res.detail == (
+        "acme.io looks like acme.com — same name, different TLD (.io vs .com)"
+    )
+
+
+def test_lookalike_detail_sld_edit_phrasing():
+    # `acrme` is one insertion away from `acme`; TLDs also differ, so we
+    # expect the dual-clause phrasing.
+    res = _check_lookalike("acrme.io", "acme.com", max_distance=1)
+    assert res.matched
+    assert res.detail == (
+        "acrme.io looks like acme.com — "
+        "name differs by 1 edit (acrme vs acme); TLDs differ (.io vs .com)"
+    )
+
+
 def test_normalize_href_strips_tab_cr_lf():
     assert link_analysis._normalize_href(
         "https://safe.com\t.evil.com/path"

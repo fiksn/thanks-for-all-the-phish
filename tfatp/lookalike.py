@@ -33,7 +33,38 @@ class LookalikeResult:
     def detail(self) -> str:
         if not self.matched:
             return f"{self.observed} != {self.protected}"
-        return f"{self.observed} ~= {self.protected} (distance {self.distance})"
+        return describe(self.observed, self.protected, self.distance)
+
+
+def describe(observed: str, protected: str, distance: int) -> str:
+    """Render a human-readable explanation of an observed/protected match.
+
+    Two shapes get distinct wording:
+    - TLD-swap: SLDs equal, TLDs differ. e.g. ``acme.io`` vs ``acme.com``.
+    - SLD edit: SLDs differ by ``distance`` characters. e.g. ``acrme`` vs
+      ``acme``. The original (pre-normalization) SLDs are shown so the
+      reader can see the literal difference, including a ``www-`` prefix
+      that we charge as a single edit.
+    """
+    obs_label, _, obs_tld = observed.partition(".")
+    pro_label, _, pro_tld = protected.partition(".")
+    same_label = obs_label == pro_label
+    same_tld = obs_tld == pro_tld
+    if same_label and not same_tld:
+        return (
+            f"{observed} looks like {protected} — "
+            f"same name, different TLD (.{obs_tld} vs .{pro_tld})"
+        )
+    edit_word = "edit" if distance == 1 else "edits"
+    name_part = (
+        f"name differs by {distance} {edit_word} ({obs_label} vs {pro_label})"
+    )
+    if same_tld:
+        return f"{observed} looks like {protected} — {name_part}"
+    return (
+        f"{observed} looks like {protected} — "
+        f"{name_part}; TLDs differ (.{obs_tld} vs .{pro_tld})"
+    )
 
 
 def registrable(domain: str) -> str:
@@ -103,5 +134,19 @@ def check(observed_domain: str, protected_domain: str,
     # returned in `observed` for the report.
     obs_label = _idn_to_unicode(observed).split(".", 1)[0]
     pro_label = _idn_to_unicode(protected).split(".", 1)[0]
-    distance = DamerauLevenshtein.distance(_skeleton(obs_label), _skeleton(pro_label))
+    # A `www-` glued into the SLD (e.g. `www-acme.io`) sails past the
+    # subdomain stripping that handles `www.acme.io`, but is the same
+    # phishing shape — register the brand name with a `www-` shim so the
+    # raw distance to the legitimate label is 4. Charge it as a single
+    # edit so the impostor falls within the configured threshold.
+    extra_cost = 0
+    if obs_label.startswith("www-") and not pro_label.startswith("www-"):
+        obs_label = obs_label[4:]
+        extra_cost = 1
+    elif pro_label.startswith("www-") and not obs_label.startswith("www-"):
+        pro_label = pro_label[4:]
+        extra_cost = 1
+    distance = extra_cost + DamerauLevenshtein.distance(
+        _skeleton(obs_label), _skeleton(pro_label)
+    )
     return LookalikeResult(distance <= max_distance, observed, protected, distance)

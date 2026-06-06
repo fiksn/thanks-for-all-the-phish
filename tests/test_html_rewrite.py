@@ -42,7 +42,7 @@ def test_corrected_eml_keeps_html_content_type():
 def test_rewrite_body_html_defangs_anchor_href():
     body = '<p>Click <a href="https://evil.example/login">here</a></p>'
     out = rewrite_body(body, "html", findings=[], neutralize_all=True, per_url=set())
-    assert 'href="hxxps://evil.example/login"' in out
+    assert 'href="https://evil.example.REMOVE-TO-VISIT.invalid/login"' in out
     # surrounding HTML structure preserved
     assert "<p>" in out and "<a " in out
 
@@ -62,7 +62,7 @@ def test_rewrite_body_html_per_url_only_touches_matched():
             '<a href="https://good.example/y">b</a>')
     out = rewrite_body(body, "html", findings=[], neutralize_all=False,
                        per_url={"https://bad.example/x"})
-    assert 'href="hxxps://bad.example/x"' in out
+    assert 'href="https://bad.example.REMOVE-TO-VISIT.invalid/x"' in out
     assert 'href="https://good.example/y"' in out
 
 
@@ -74,31 +74,73 @@ def test_rewrite_body_html_annotates_anchor_with_warning():
         warnings=[YoungDomain(domain="bad.example", age_days=10)],
     )]
     out = rewrite_body(body, "html", findings=findings, neutralize_all=False, per_url=set())
-    assert "[WARNING: young (10d)]" in out
-    assert "color:#c00" in out
+    # Warning lives on a ⚠ icon span appended after the anchor; the anchor
+    # itself stays untouched (no style, no title, original contents).
+    assert "⚠" in out
+    assert 'title="https://bad.example/x WARNING: young (10d)"' in out
+    # The anchor still says "click" and has no extra attributes.
+    assert ">click</a>" in out
+    assert "border-bottom" not in out
+    # No inline `[WARNING: ...]` text in the body anymore.
+    assert "[WARNING:" not in out
 
 
-def test_corrected_html_banner_lists_defanged_urls_when_neutralize_all():
-    raw = _html_eml('<a href="https://bad.example/x">click</a>')
+def test_rewrite_body_html_preserves_anchor_contents():
+    # Button text, image, styled span must survive a whole-body defang;
+    # only the href changes — hostname gets a `.REMOVE-TO-VISIT.invalid`
+    # suffix so Gmail keeps the anchor clickable but DNS never resolves.
+    body = '<a class="btn" href="https://bad.example/x">Verify Account</a>'
+    out = rewrite_body(body, "html", findings=[], neutralize_all=True, per_url=set())
+    assert 'href="https://bad.example.REMOVE-TO-VISIT.invalid/x"' in out
+    assert ">Verify Account</a>" in out
+    assert 'class="btn"' in out
+
+
+def test_rewrite_body_html_does_not_touch_mailto_anchors():
+    # `mailto:` anchors are not URLs we defang; the visible email
+    # address inside must not be altered.
+    body = (
+        'Contact <a href="mailto:alice@example.com">alice@example.com</a>'
+        ' for details.'
+    )
+    out = rewrite_body(body, "html", findings=[], neutralize_all=True, per_url=set())
+    assert 'href="mailto:alice@example.com"' in out
+    assert ">alice@example.com</a>" in out
+
+
+def test_defang_preserves_scheme_and_uses_invalid_suffix():
+    # The defanged URL keeps `https://` so Gmail's sanitizer leaves the
+    # anchor clickable, and the hostname picks up a `.invalid` suffix so
+    # DNS resolution fails. Port + path + query survive unchanged.
+    from tfatp.link_analysis import defang
+    out = defang("https://mail.bad.example:8443/login?check=x", ".REMOVE.invalid")
+    assert out == "https://mail.bad.example.REMOVE.invalid:8443/login?check=x"
+
+
+def test_defang_custom_suffix_threads_through_rewrite_body():
+    body = '<a href="https://bad.example/x">click</a>'
+    out = rewrite_body(
+        body, "html", findings=[], neutralize_all=True, per_url=set(),
+        defang_suffix=".STRIP.example",
+    )
+    assert 'href="https://bad.example.STRIP.example/x"' in out
+
+
+def test_rewrite_body_html_preserves_existing_anchor_title():
+    body = (
+        '<a href="https://bad.example/x" title="Click here to verify">'
+        'click</a>'
+    )
     findings = [LinkFinding(
         url="https://bad.example/x", host="bad.example", domain="bad.example",
-        age_days=None, has_password_form=False, warnings=[],
+        age_days=10, has_password_form=False,
+        warnings=[YoungDomain(domain="bad.example", age_days=10)],
     )]
-    annotated = rewrite_body(
-        '<a href="https://bad.example/x">click</a>', "html",
-        findings, neutralize_all=True, per_url=set(),
-    )
-    corrected = build_corrected_eml(
-        raw, annotated, findings, neutralize_all=True, body_subtype="html",
-    )
-    body = _decoded_html(corrected)
-    # The domain is enumerated under the cascade-defang line; URLs no
-    # longer appear in warning text (would be clickable).
-    assert "Defanged (gate tripped earlier)" in body
-    assert "bad.example" in body
-    assert "https://bad.example/x" not in body  # not surfaced in warnings
-    # Original HTML structure stayed
-    assert "<a " in body
+    out = rewrite_body(body, "html", findings=findings, neutralize_all=False, per_url=set())
+    # Original title intact; the warning rides on a separate ⚠ icon span.
+    assert 'title="Click here to verify"' in out
+    assert "⚠" in out
+    assert 'title="https://bad.example/x WARNING: young (10d)"' in out
 
 
 def test_corrected_html_banner_uses_html_styling():
@@ -111,14 +153,14 @@ def test_corrected_html_banner_uses_html_styling():
     corrected = build_corrected_eml(raw, "<p>hi</p>", [finding], body_subtype="html")
     body = _decoded_html(corrected)
     assert "border:2px solid #c00" in body  # styled banner
-    assert "thanks-for-all-the-phish analysis" in body
+    assert ">WARNING:</div>" in body
 
 
 def test_corrected_html_banner_suppressed_when_no_findings():
     raw = _html_eml('<p>hi</p>')
     corrected = build_corrected_eml(raw, "<p>hi</p>", [], body_subtype="html")
     body = _decoded_html(corrected)
-    assert "thanks-for-all-the-phish analysis" not in body
+    assert ">WARNING:</div>" not in body
 
 
 def test_external_warning_html_renders_verbatim_in_html_body():
@@ -131,7 +173,7 @@ def test_external_warning_html_renders_verbatim_in_html_body():
     body = _decoded_html(corrected)
     assert custom in body
     # No analysis banner when nothing else fired.
-    assert "thanks-for-all-the-phish analysis" not in body
+    assert ">WARNING:</div>" not in body
 
 
 # --- tracking-pixel neutralization ------------------------------------------

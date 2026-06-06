@@ -177,10 +177,11 @@ sender). An empty list disables rewriting entirely.
 
 | Command | Purpose | Auth mode |
 |---|---|---|
-| `python -m tfatp` | Single-user watcher, prints latest message + new mail with DKIM/link analysis. | oauth or DWD |
+| `python -m tfatp` (= `python -m tfatp.cli.watch_mailbox`) | Single-user watcher, prints latest message + new mail with DKIM/link analysis. | oauth or DWD |
 | `python -m tfatp.cli.analyze_eml` | Run analysis on an `.eml` from stdin/file, emit a rewritten `.eml` on stdout. | none |
 | `python -m tfatp.cli.inject_eml` | Inject a raw `.eml` into the mailbox, simulating arrival (triggers IDLE/Pub/Sub/poll like a real receive). | oauth or DWD |
 | `python -m tfatp.cli.replace_message <id>` | Delete + insert one message manually (needs `--yes`). | oauth or DWD |
+| `python -m tfatp.cli.diff_message <id>` | Show what tfatp did to a rewritten message: header additions, DKIM verdict on the original, body diff. | oauth or DWD |
 | `python -m tfatp.cli.watch_domain` | Watch every user in the domain via Pub/Sub with polling fallback. | DWD only |
 
 ## Permissions, scopes, and IAM
@@ -405,6 +406,86 @@ Manual round-trip:
 python -m tfatp.cli.analyze_eml original.eml > corrected.eml
 python -m tfatp.cli.replace_message MESSAGE_ID < corrected.eml       # dry run
 python -m tfatp.cli.replace_message --yes MESSAGE_ID < corrected.eml # commit
+```
+
+## Inspecting a rewritten message
+
+`python -m tfatp.cli.diff_message <id>` shows exactly what the rewriter did to
+a message that's still sitting in the mailbox. Useful for "is this banner
+real?" debugging and after-the-fact audits.
+
+Identifier forms accepted:
+
+- **Gmail hex id** — the form the watcher prints (`18f3c2a9b4d5e6f7`). Passed
+  to `users.messages.get` as-is.
+- **RFC 822 Message-ID** — what `View original` in Gmail shows
+  (`<CADna=9z…@mail.gmail.com>`). The CLI detects the `@` and resolves it to
+  the hex id via `users.messages.list(q="rfc822msgid:…")` first.
+
+What the command does, in order:
+
+1. **Fetch** the raw RFC 822 bytes for the message id.
+2. **Marker check.** Read the `X-Checked-By` header. If it isn't
+   `tfatp/<version>`, the message was never rewritten and the command exits
+   `1`. The watcher uses the same marker to skip its own rewrites, so the
+   check is authoritative.
+3. **HMAC verify** (if `loop_guard_secret` is set in config). The watcher
+   stamps every rewrite with an `X-Checked-Mac` HMAC over the Message-ID.
+   The CLI prints whether the MAC validates under the current secret —
+   useful when a secret rotation is in flight.
+4. **Find the embedded original.** Walk the MIME tree for a
+   `message/rfc822` part named `original.eml`. That's the verbatim bytes
+   the sender's MTA delivered, preserved as an attachment. Missing or
+   unreadable → exit `2`.
+5. **Verify DKIM** on the embedded original bytes. If DKIM passes, the
+   diff is trustworthy: nobody between the sender and now (including a
+   tampered-with rewrite) could have altered the original. If DKIM fails
+   the diff is still printed, but exit code `3` flags it as untrusted —
+   scripts can gate on the exit status.
+6. **Render header diff.** Headers that the rewriter added (or that
+   start with `x-checked-`) are listed: `X-Checked-By`, `X-Checked-Mac`,
+   `X-Checked-Findings`, etc.
+7. **Render body diff.** Unified diff between the original body and the
+   rewritten body (with the embedded `original.eml` attachment stripped
+   from the comparison so it isn't reported as a giant addition). Lines
+   are whitespace-normalised before diffing — runs of spaces collapse to
+   one, leading/trailing whitespace is dropped, and consecutive empty
+   lines fold to one. That hides HTML reformatting noise from the
+   BeautifulSoup round-trip and lets the diff highlight the changes that
+   actually matter: banner additions, defanged URLs, header tweaks. Drop
+   to a byte-level comparison by extracting `original.eml` from the
+   rewritten message manually if you need it.
+
+Example:
+
+```bash
+$ python -m tfatp.cli.diff_message 18f3c2a9b4d5e6f7
+processed by tfatp — x-checked-by: tfatp/0.1.0
+x-checked-mac: valid HMAC
+original.eml: 4831 bytes
+DKIM on original: pass (domain=example.com, selector=s1)
+
+--- headers added by tfatp ---
+  + X-Checked-Findings: https://login.bad.example/ -> password form
+  + X-Checked-SMTP: pass (250 OK)
+
+--- body diff (original → rewritten, excluding original.eml attachment) ---
+@@
++CAUTION: This email originated from outside of the organization. …
++WARNING:
++  - Sender impersonation: …
++  - Links to young domains: …
+ …original body lines…
+-https://login.bad.example/
++https://login.bad.example.REMOVE-TO-VISIT.invalid/
+```
+
+Auth and impersonation:
+
+```bash
+python -m tfatp.cli.diff_message <id>                              # current user
+python -m tfatp.cli.diff_message <id> --as alice@example.com       # DWD only
+python -m tfatp.cli.diff_message <id> --config other.toml          # alt config
 ```
 
 ## Testing the pipeline safely

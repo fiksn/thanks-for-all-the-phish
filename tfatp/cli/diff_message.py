@@ -90,6 +90,31 @@ def _text_body(msg: Message) -> str:
     return plain or html
 
 
+def _normalize_for_diff(text: str) -> list[str]:
+    """Strip indentation and runs of empty lines so the diff focuses on content.
+
+    HTML round-tripped through BeautifulSoup gets re-serialised with subtly
+    different inter-tag whitespace and attribute formatting — none of it
+    visible after rendering, all of it noisy in a `diff`. Normalising each
+    line down to its content (single internal spaces, no leading/trailing
+    whitespace) and collapsing consecutive empties makes the diff highlight
+    semantic changes — banner additions, defanged URLs — rather than parser
+    reformatting.
+    """
+    out: list[str] = []
+    prev_empty = False
+    for raw in text.splitlines():
+        collapsed = " ".join(raw.split())
+        if not collapsed:
+            if prev_empty:
+                continue
+            prev_empty = True
+        else:
+            prev_empty = False
+        out.append(collapsed + "\n")
+    return out
+
+
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
@@ -159,10 +184,11 @@ def main(argv: list[str]) -> int:
     new_text = _text_body(stripped_current)
 
     print()
-    print("--- body diff (original → rewritten, excluding original.eml attachment) ---")
+    print("--- body diff (original → rewritten, whitespace-normalised, "
+          "excluding original.eml attachment) ---")
     diff = list(difflib.unified_diff(
-        orig_text.splitlines(keepends=True),
-        new_text.splitlines(keepends=True),
+        _normalize_for_diff(orig_text),
+        _normalize_for_diff(new_text),
         fromfile="original",
         tofile=f"id={args.message_id}",
         n=3,

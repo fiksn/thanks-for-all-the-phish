@@ -9,20 +9,43 @@ from tfatp.addr import extract_address, sender_allowed
 from tfatp.analyze_eml import analyze_with_gate, build_corrected_eml, rewrite_body
 from tfatp.client import GmailClient
 from tfatp.defang_policy import DefangPolicy, compute as compute_defang
+from tfatp.dkim_verify import verify as verify_dkim
 from tfatp.link_analysis import LinkFinding, message_body
 
 __all__ = ["extract_address", "sender_allowed", "replace_message", "maybe_rewrite_new_mail"]
 
 
+_LABELS_NOT_TO_COPY = frozenset({
+    # SENT/DRAFT/CHAT don't apply to an inbound rewrite; TRASH/SPAM would
+    # immediately hide our copy. If the original was already in TRASH or SPAM
+    # the user wouldn't be running this on it, so dropping these is safe.
+    "SENT", "DRAFT", "CHAT", "TRASH", "SPAM",
+})
+
+
 def replace_message(client: GmailClient, message_id: str, new_raw: bytes) -> str:
     """Permanently delete `message_id` and insert `new_raw`. Returns new id.
+
+    Labels (system + user) and read state are copied from the original onto
+    the inserted copy, so a previously-unread message stays unread and any
+    user-applied labels survive the round-trip.
 
     This is destructive — the original is unrecoverable from Trash. The corrected
     message embeds the original as a message/rfc822 attachment, so the content is
     preserved inside the new message.
     """
-    print(f"[rewrite] insert: {len(new_raw)} bytes", file=sys.stderr)
-    new_id = client.insert_message(new_raw)
+    labels = [
+        label for label in client.get_message_labels(message_id)
+        if label not in _LABELS_NOT_TO_COPY
+    ]
+    if "INBOX" not in labels:
+        # Defensive: every code path that triggers a rewrite started from an
+        # INBOX message, but a race (user archived it mid-flight) would land
+        # the rewritten copy in "All Mail" only. Keep INBOX so the user still
+        # sees the warning.
+        labels.append("INBOX")
+    print(f"[rewrite] insert: {len(new_raw)} bytes, labels={labels}", file=sys.stderr)
+    new_id = client.insert_message(new_raw, label_ids=labels)
     print(f"[rewrite] inserted new_id={new_id}", file=sys.stderr)
     # Delete only after insert succeeds, so a failed insert doesn't lose the mail.
     print(f"[rewrite] delete: old_id={message_id}", file=sys.stderr)
@@ -146,15 +169,23 @@ def maybe_rewrite_new_mail(
         defang_policy,
         external_warning=external_warning_triggered,
     )
-    annotated = rewrite_body(body, body_subtype, findings, neutralize_all, per_url)
+    annotated = rewrite_body(
+        body, body_subtype, findings, neutralize_all, per_url,
+        defang_suffix=cfg.defang_url_suffix,
+    )
     intro_text = cfg.external_warning_text if external_warning_triggered else ""
     intro_html = cfg.external_warning_html if external_warning_triggered else ""
+    # DKIM is verified once per message and threaded into the banner —
+    # display-only, never an input to scoring/gating/defang.
+    dkim_result = verify_dkim(raw)
     new_raw = build_corrected_eml(
         raw, annotated, findings, smtp_result, sender_lookalike, neutralize_all,
         loop_guard_secret=cfg.loop_guard_secret,
         body_subtype=body_subtype,
         external_warning_text=intro_text,
         external_warning_html=intro_html,
+        defang_suffix=cfg.defang_url_suffix,
+        dkim_result=dkim_result,
     )
 
     print(

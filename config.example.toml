@@ -72,22 +72,26 @@ sender_whitelist = ['.*\.atlassian\.net']
 # its network actions are not taken. The default cascade is:
 #   phase 0 — informational only, never gates:
 #             external_warning        (yellow banner if sender outside org)
-#   phase 1 — cheap data-only checks on the sender:
-#             sender_domain_age, sender_lookalike
-#   phase 2 — probe the sender's MX over SMTP (touches their server):
-#             smtp_verify
-#   phase 3 — data-only checks on each link's registrable domain:
+#   phase 1 — all offline / non-attacker-revealing checks. RDAP hits rdap.org
+#             (sender doesn't see it) and Levenshtein is pure CPU; running them
+#             here means link-level warnings still surface even when the sender
+#             check trips, instead of being suppressed by an earlier phase fail:
+#             sender_domain_age, sender_lookalike,
 #             check_link_domain_age   (RDAP at rdap.org)
 #             check_link_lookalike    (vs recipient domain, no network)
-#   phase 4 — fetch every URL in the body to look for password forms and
+#   phase 2 — probe the sender's MX over SMTP (touches their server):
+#             smtp_verify
+#   phase 3 — fetch every URL in the body to look for password forms and
 #             resolve redirectors (exposes your IP to the destination):
 #             check_password_form
 # Each stage may appear in at most one phase. Unknown stages are rejected.
 check_phases = [
     ["external_warning"],
-    ["sender_domain_age", "sender_lookalike"],
+    [
+        "sender_domain_age", "sender_lookalike",
+        "check_link_domain_age", "check_link_lookalike",
+    ],
     ["smtp_verify"],
-    ["check_link_domain_age", "check_link_lookalike"],
     ["check_password_form"],
 ]
 
@@ -103,10 +107,19 @@ check_phases_internal = [
 # external + stage listed in check_phases above). Purely informational — it
 # never gates other phases. Remove `external_warning` from check_phases to
 # suppress the banner entirely.
-external_warning_text = "Sender is external to the organization, beware."
+external_warning_text = "CAUTION: This email originated from outside of the organization. Do not click links or attachments unless you recognize the sender and know the content is safe."
 # HTML version, used when the body is text/html. Rendered verbatim — you own
-# the markup and styling. Default is a yellow boxed banner.
-external_warning_html = '''<div style="border:2px solid #b58900; background:#fffbe6; padding:12px; margin:0 0 16px 0; font-family:Roboto,Arial,Helvetica,sans-serif; font-size:14px; color:#5a4a00;"><div style="font-weight:bold;">Sender is external to the organization, beware.</div></div>'''
+# the markup and styling. Default mirrors the Outlook external-sender notice
+# (pale-yellow box, red "CAUTION:" prefix).
+external_warning_html = '''<div style="border:1px solid #d0c47a; background:#fff8c4; padding:10px; margin:0 0 16px 0; font-family:Roboto,Arial,Helvetica,sans-serif; font-size:14px; color:#222;"><span style="color:#c00; font-weight:bold;">CAUTION:</span> This email originated from outside of the organization. Do not click links or attachments unless you recognize the sender and know the content is safe.</div>'''
+
+# Suffix appended to a URL's hostname when a link is defanged. The scheme is
+# left as `https://` so Gmail/OWA keep the anchor clickable; the hostname
+# gets this suffix tacked on, which guarantees the click goes to a name DNS
+# can't resolve. ``.invalid`` is RFC 6761 reserved (will never resolve), and
+# the visible label tells the recipient how to recover the real URL if they
+# really want it.
+defang_url_suffix = ".REMOVE-TO-VISIT.invalid"
 
 # Required when rewrite_only_from is non-empty. Used as the HMAC key that
 # stamps every inserted copy with an X-Checked-Mac header, so the watcher

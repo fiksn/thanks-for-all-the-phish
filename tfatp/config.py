@@ -17,9 +17,11 @@ CHECK_STAGES = (
     "external_warning",
 )
 _DEFAULT_CHECK_PHASES: tuple[tuple[str, ...], ...] = (
-    ("sender_domain_age", "sender_lookalike"),
+    (
+        "sender_domain_age", "sender_lookalike",
+        "check_link_domain_age", "check_link_lookalike",
+    ),
     ("smtp_verify",),
-    ("check_link_domain_age", "check_link_lookalike"),
     ("check_password_form",),
 )
 # For mail whose sender domain is part of the workspace, the checks that
@@ -30,14 +32,23 @@ _DEFAULT_CHECK_PHASES: tuple[tuple[str, ...], ...] = (
 _DEFAULT_CHECK_PHASES_INTERNAL: tuple[tuple[str, ...], ...] = (
     ("check_password_form",),
 )
-_DEFAULT_EXTERNAL_WARNING_TEXT = "Sender is external to the organization, beware."
+_DEFAULT_EXTERNAL_WARNING_TEXT = (
+    "CAUTION: This email originated from outside of the organization. "
+    "Do not click links or attachments unless you recognize the sender "
+    "and know the content is safe."
+)
+# Outlook-style banner: pale yellow background, dark text, red "CAUTION:"
+# prefix only — matches the appearance users already associate with this
+# warning from Exchange.
 _DEFAULT_EXTERNAL_WARNING_HTML = (
-    '<div style="border:2px solid #b58900; background:#fffbe6; padding:12px; '
+    '<div style="border:1px solid #d0c47a; background:#fff8c4; padding:10px; '
     'margin:0 0 16px 0; font-family:Roboto,Arial,Helvetica,sans-serif; '
-    'font-size:14px; color:#5a4a00;">'
-    '<div style="font-weight:bold;">'
-    "Sender is external to the organization, beware."
-    "</div></div>"
+    'font-size:14px; color:#222;">'
+    '<span style="color:#c00; font-weight:bold;">CAUTION:</span> '
+    "This email originated from outside of the organization. "
+    "Do not click links or attachments unless you recognize the sender "
+    "and know the content is safe."
+    "</div>"
 )
 # Sender hosts matching any of these regexes (re.fullmatch) skip the
 # sender-side checks (sender_domain_age, sender_lookalike, smtp_verify).
@@ -185,6 +196,7 @@ class Config:
     check_phases_internal: tuple[tuple[str, ...], ...]
     external_warning_text: str
     external_warning_html: str
+    defang_url_suffix: str
     loop_guard_secret: str
     rewrite_only_from: tuple[str, ...]
     admin_user: str
@@ -262,6 +274,9 @@ def load_config(path: str | Path = "config.toml") -> Config:
         ),
         external_warning_html=str(
             raw.get("external_warning_html", _DEFAULT_EXTERNAL_WARNING_HTML)
+        ),
+        defang_url_suffix=str(
+            raw.get("defang_url_suffix", ".REMOVE-TO-VISIT.invalid")
         ),
         loop_guard_secret=_loop_guard_secret(
             raw.get("loop_guard_secret", ""),

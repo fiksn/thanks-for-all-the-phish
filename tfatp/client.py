@@ -109,6 +109,21 @@ class GmailClient:
             raise LookupError(f"no message with Message-ID <{rfc_id}> in this mailbox")
         return messages[0]["id"]
 
+    def get_message_labels(self, message_id: str) -> list[str]:
+        """Return the set of labelIds currently on a message.
+
+        Includes system labels (INBOX, UNREAD, IMPORTANT, STARRED, CATEGORY_*)
+        and user labels. Used by the rewriter to preserve read state and
+        user-applied labels across the delete+insert round-trip.
+        """
+        payload = (
+            self._service.users()
+            .messages()
+            .get(userId=self._user_id, id=message_id, format="minimal")
+            .execute()
+        )
+        return list(payload.get("labelIds", []))
+
     def get_raw_message(self, message_id: str) -> bytes:
         """Return the raw RFC822 bytes of a message (needed for DKIM verification)."""
         payload = (
