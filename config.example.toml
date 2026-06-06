@@ -145,6 +145,20 @@ rewrite_only_from = []
 # lists users in the domain. Leave empty to skip user enumeration.
 admin_user = ""
 
+# Optional filters on whose mailbox `watch_domain` actually watches. Both lists
+# contain regex strings (re.fullmatch, case-insensitive) matched against the
+# user's primary email — same shape as `rewrite_only_from`. Both are optional.
+#   - Empty `include_users` ([] or omitted) = every discovered user is in.
+#   - Non-empty `include_users` narrows to users matching at least one pattern.
+#   - `exclude_users` then trims that set: any match here is dropped.
+# Example: watch everyone except known service accounts and one contractor —
+#   exclude_users = ["noreply@example\\.com", "contractor@example\\.com"]
+# Example: watch only the finance team and never the head of finance —
+#   include_users = [".*@finance\\.example\\.com"]
+#   exclude_users = ["cfo@finance\\.example\\.com"]
+include_users = []
+exclude_users = []
+
 # Cloud Pub/Sub config for push-based new-mail notifications.
 # If any of these is empty, watch_domain falls back to the polling loop.
 pubsub_project_id = ""

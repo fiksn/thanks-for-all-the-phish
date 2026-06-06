@@ -139,6 +139,32 @@ def _rewrite_only_from(value: object, *, field: str = "rewrite_only_from") -> tu
     return tuple(out)
 
 
+def _user_patterns(value: object, *, field: str) -> tuple[str, ...]:
+    """Parse a list of email-regex strings, validating each pattern.
+
+    Same shape as ``rewrite_only_from``: every entry is a regex matched
+    case-insensitively (we lower-case patterns and emails before fullmatch)
+    against the workspace user's primary email. Empty / missing → ``()``.
+    """
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError(f"{field} must be a list of regex strings")
+    out: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str):
+            raise ValueError(f"{field} must be a list of regex strings")
+        pat = entry.strip()
+        if not pat:
+            continue
+        try:
+            re.compile(pat)
+        except re.error as exc:
+            raise ValueError(f"{field}: invalid regex {pat!r}: {exc}") from exc
+        out.append(pat.lower())
+    return tuple(out)
+
+
 def _sender_whitelist(value: object, *, field: str = "sender_whitelist") -> tuple[str, ...]:
     if value is None:
         return _DEFAULT_SENDER_WHITELIST
@@ -200,6 +226,8 @@ class Config:
     loop_guard_secret: str
     rewrite_only_from: tuple[str, ...]
     admin_user: str
+    include_users: tuple[str, ...]
+    exclude_users: tuple[str, ...]
     pubsub_project_id: str
     pubsub_topic: str
     pubsub_subscription: str
@@ -284,6 +312,8 @@ def load_config(path: str | Path = "config.toml") -> Config:
         ),
         rewrite_only_from=_rewrite_only_from(raw.get("rewrite_only_from")),
         admin_user=str(raw.get("admin_user", "") or ""),
+        include_users=_user_patterns(raw.get("include_users"), field="include_users"),
+        exclude_users=_user_patterns(raw.get("exclude_users"), field="exclude_users"),
         pubsub_project_id=str(raw.get("pubsub_project_id", "") or ""),
         pubsub_topic=str(raw.get("pubsub_topic", "") or ""),
         pubsub_subscription=str(raw.get("pubsub_subscription", "") or ""),

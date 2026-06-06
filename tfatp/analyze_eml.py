@@ -128,18 +128,20 @@ def _banner_lines(
                 other.append(str(w))
 
     lines: list[str] = []
+    if sender_lookalike is not None and sender_lookalike.matched:
+        lines.append(f"Sender impersonation: {sender_lookalike.detail}")
+    # Sender-domain-age findings sit next to the sender impersonation line —
+    # both describe the same actor, they read as a single thought.
+    lines.extend(sender_notes)
     if dkim_result is not None and dkim_result.status != "pass":
         if dkim_result.status == "none":
-            lines.append("DKIM: no signature on the message")
+            lines.append("DKIM: no message signature")
         elif dkim_result.status == "fail":
             lines.append(f"DKIM: signature verification failed ({dkim_result.detail})")
         else:  # "error"
             lines.append(f"DKIM: verification error ({dkim_result.detail})")
-    if sender_lookalike is not None and sender_lookalike.matched:
-        lines.append(f"Sender impersonation: {sender_lookalike.detail}")
     if smtp_result is not None:
         lines.append(f"SMTP: {smtp_result.status} ({smtp_result.detail})")
-    lines.extend(sender_notes)
     if young_known or young_unknown:
         parts = [f"{d} ({age}d)" for d, age in sorted(young_known.items())]
         parts += [f"{d} (age unknown)" for d in sorted(young_unknown)]
@@ -209,6 +211,71 @@ def _banner_html(
     return "".join(parts)
 
 
+# Per-header byte budgets. RFC 5322 allows arbitrarily long folded header
+# values, but real-world MTAs, IMAP servers, and some webmail clients trip on
+# multi-KB headers (truncated display, parser quirks, occasional 5xx). A
+# couple of KB per header is plenty for everything we surface — hostnames
+# top out around 253 chars each, lookalike detail strings stay well under
+# 1 KB, and SMTP rejection text from any MX I've seen is < 500 bytes.
+_HEADER_BUDGET = 2048
+_FINDINGS_HEADER_BUDGET = 4096
+_FINDINGS_HEADER_OVERFLOW_SUFFIX_BUDGET = 32  # reserve room for "; … +N more"
+
+
+def _capped(value: str, budget: int = _HEADER_BUDGET) -> str:
+    """Truncate ``value`` so it never exceeds ``budget`` bytes, marking
+    truncation with a trailing ellipsis. Short values pass through unchanged.
+    """
+    if len(value) <= budget:
+        return value
+    return value[: budget - 1] + "…"
+
+
+def _render_findings_header(findings: list[LinkFinding]) -> str:
+    """Build the ``X-Checked-Findings`` value, capped at ~4 KB.
+
+    Per RFC 5322 a single header value can be arbitrarily long (folded), but
+    pathological cases — a marketing mail with hundreds of unique link
+    domains, or a worm with thousands of synthetic URLs — produce headers
+    that break some clients' truncation heuristics and bloat the rewritten
+    message body for no real gain. The banner already aggregates the same
+    information for human reading; this header is for tooling, so trading
+    completeness for a fixed budget is the right call.
+
+    Findings are appended in iteration order until the budget is reached.
+    Any remaining findings are summarised as ``; … +N more`` so consumers
+    know detail was elided without having to compare counts elsewhere.
+    """
+    rendered: list[str] = []
+    skipped = 0
+    used = 0
+    soft_limit = _FINDINGS_HEADER_BUDGET - _FINDINGS_HEADER_OVERFLOW_SUFFIX_BUDGET
+    for f in findings:
+        if not f.warnings:
+            continue
+        entry = f"{f.url} -> {', '.join(str(w) for w in f.warnings)}"
+        # +2 accounts for the "; " separator between entries (zero on first).
+        cost = len(entry) + (2 if rendered else 0)
+        if rendered and used + cost > soft_limit:
+            skipped += 1
+            continue
+        if not rendered and len(entry) > _FINDINGS_HEADER_BUDGET:
+            # Single finding longer than the whole budget — truncate it
+            # rather than emit nothing, so consumers see something.
+            entry = entry[:_FINDINGS_HEADER_BUDGET - 1] + "…"
+            rendered.append(entry)
+            used = len(entry)
+            continue
+        rendered.append(entry)
+        used += cost
+    if not rendered:
+        return ""
+    summary = "; ".join(rendered)
+    if skipped:
+        summary += f"; … +{skipped} more"
+    return summary
+
+
 def build_corrected_eml(
     raw: bytes,
     annotated_body: str,
@@ -231,9 +298,19 @@ def build_corrected_eml(
 
     new_msg = EmailMessage(policy=policy.SMTP)
     for k, v in original.items():
-        if k.lower() in _HEADERS_TO_REWRITE:
+        kl = k.lower()
+        if kl in _HEADERS_TO_REWRITE:
             continue
-        if k.lower() == "subject":
+        # Drop any sender-supplied X-Checked-* header. EmailMessage["k"] = v
+        # appends rather than replaces, so copying these through would leave
+        # two values present (sender's first, ours second). The loop-guard
+        # check reads the *first* X-Checked-By value, which would let a
+        # sender bypass rewrite by stamping their own message with the same
+        # marker. The HMAC field is the only real anti-spoof, but the simple
+        # fix is to never carry sender-supplied X-Checked-* across at all.
+        if kl.startswith("x-checked-"):
+            continue
+        if kl == "subject":
             # Defang any URL that appears in the Subject so a recipient client
             # that auto-linkifies subject text can't follow it directly.
             v = _defang_subject_urls(str(v), defang_suffix)
@@ -245,13 +322,12 @@ def build_corrected_eml(
             loop_guard_secret, str(original.get("Message-Id", ""))
         )
     if smtp_result is not None:
-        new_msg["X-Checked-SMTP"] = f"{smtp_result.status} ({smtp_result.detail})"
+        new_msg["X-Checked-SMTP"] = _capped(
+            f"{smtp_result.status} ({smtp_result.detail})"
+        )
     if sender_lookalike is not None and sender_lookalike.matched:
-        new_msg["X-Checked-Sender-Lookalike"] = sender_lookalike.detail
-    suspect_summary = "; ".join(
-        f"{f.url} -> {', '.join(str(w) for w in f.warnings)}"
-        for f in findings if f.warnings
-    )
+        new_msg["X-Checked-Sender-Lookalike"] = _capped(sender_lookalike.detail)
+    suspect_summary = _render_findings_header(findings)
     if suspect_summary:
         new_msg["X-Checked-Findings"] = suspect_summary
 

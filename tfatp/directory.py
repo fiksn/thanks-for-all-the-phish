@@ -8,6 +8,8 @@ Requires:
   delegated to a non-admin even with DWD.
 """
 
+import re
+
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 from googleapiclient.discovery import build
 
@@ -49,3 +51,35 @@ def list_workspace_users(cfg: Config, include_suspended: bool = False) -> list[s
         if not page_token:
             break
     return users
+
+
+def filter_users(
+    users: list[str],
+    include: tuple[str, ...] = (),
+    exclude: tuple[str, ...] = (),
+) -> list[str]:
+    """Apply optional include then exclude regex filters to a user list.
+
+    Both arguments default to empty, so the no-filter case returns ``users``
+    unchanged. Semantics match the documented precedence: an empty
+    ``include`` means "every user is in"; a non-empty ``include`` narrows
+    to users whose primary email ``fullmatch``-es at least one entry.
+    ``exclude`` then trims that narrowed set: anything matching at least
+    one exclude pattern is dropped.
+
+    Patterns are case-insensitive — matching uses the lower-cased email
+    against the already-lower-cased patterns from config.
+    """
+    if not include and not exclude:
+        return users
+    inc = tuple(re.compile(p) for p in include)
+    exc = tuple(re.compile(p) for p in exclude)
+    out: list[str] = []
+    for u in users:
+        lu = u.lower()
+        if inc and not any(p.fullmatch(lu) for p in inc):
+            continue
+        if exc and any(p.fullmatch(lu) for p in exc):
+            continue
+        out.append(u)
+    return out

@@ -65,7 +65,24 @@ def main(argv: list[str]) -> int:
               f"admin.directory.user.readonly DWD scope.", file=sys.stderr)
         return 2
 
-    print(f"[domain] discovered {len(users)} user(s) in {cfg.domain}")
+    discovered = len(users)
+    if cfg.include_users or cfg.exclude_users:
+        from tfatp.directory import filter_users
+        users = filter_users(users, include=cfg.include_users, exclude=cfg.exclude_users)
+        print(
+            f"[domain] discovered {discovered} user(s) in {cfg.domain}; "
+            f"after include/exclude filters: {len(users)}"
+        )
+    else:
+        print(f"[domain] discovered {discovered} user(s) in {cfg.domain}")
+
+    if not users:
+        print(
+            "error: no users left to watch after include/exclude filters. "
+            "Adjust include_users / exclude_users in config.",
+            file=sys.stderr,
+        )
+        return 2
 
     pubsub_configured = bool(
         cfg.pubsub_project_id and cfg.pubsub_topic and cfg.pubsub_subscription

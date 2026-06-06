@@ -180,6 +180,7 @@ sender). An empty list disables rewriting entirely.
 | `python -m tfatp` (= `python -m tfatp.cli.watch_mailbox`) | Single-user watcher, prints latest message + new mail with DKIM/link analysis. | oauth or DWD |
 | `python -m tfatp.cli.analyze_eml` | Run analysis on an `.eml` from stdin/file, emit a rewritten `.eml` on stdout. | none |
 | `python -m tfatp.cli.inject_eml` | Inject a raw `.eml` into the mailbox, simulating arrival (triggers IDLE/Pub/Sub/poll like a real receive). | oauth or DWD |
+| `python -m tfatp.cli.phishing_test <eml>` | Bulk-inject the same `.eml` into every workspace user filtered by include/exclude regexes — phishing drills, pipeline validation. Always run `--dry-run` first. | DWD only |
 | `python -m tfatp.cli.replace_message <id>` | Delete + insert one message manually (needs `--yes`). | oauth or DWD |
 | `python -m tfatp.cli.diff_message <id>` | Show what tfatp did to a rewritten message: header additions, DKIM verdict on the original, body diff. | oauth or DWD |
 | `python -m tfatp.cli.watch_domain` | Watch every user in the domain via Pub/Sub with polling fallback. | DWD only |
