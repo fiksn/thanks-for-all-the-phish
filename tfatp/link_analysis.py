@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from email import policy
 from email.utils import getaddresses, parsedate_to_datetime
 from functools import lru_cache
-from urllib.parse import quote, urlparse, urlunparse
+from urllib.parse import quote, urljoin, urlparse, urlunparse
 
 import drawbridge
 import drawbridge.sync
@@ -256,12 +256,18 @@ _UNSAFE_FETCH_RE = re.compile(
     r"email[-_]?prefs?|email[-_]?settings|"
     r"manage[-_]?subscription|"
     # --- Account-state changes (lock/freeze/suspend/delete account) ---
-    r"lock[-_]?(?:account|wallet|user|card)|"
-    r"unlock[-_]?(?:account|wallet|user|card)|"
-    r"freeze[-_]?(?:account|wallet|user|card)|"
-    r"suspend[-_]?(?:account|wallet|user)|"
+    # The compound form keeps catching `lock-account` etc; making the
+    # tail optional means a bare `/lock/`, `/freeze/`, etc. segment also
+    # trips, which is the common shape when the verb is its own path
+    # component followed by an opaque token.
+    r"lock(?:[-_]?(?:account|wallet|user|card))?|"
+    r"unlock(?:[-_]?(?:account|wallet|user|card))?|"
+    r"freeze(?:[-_]?(?:account|wallet|user|card))?|"
+    r"unfreeze(?:[-_]?(?:account|wallet|user|card))?|"
+    r"suspend(?:[-_]?(?:account|wallet|user))?|"
     r"disable[-_]?(?:account|wallet|user|2fa|mfa)|"
     r"deactivate(?:[-_]?account)?|"
+    r"reactivate(?:[-_]?account)?|"
     r"close[-_]?account|"
     r"delete[-_]?account|"
     r"block[-_]?(?:account|user|sender)|"
@@ -633,41 +639,71 @@ _TRACKING_REDIRECTOR_DOMAINS = frozenset({
 _KNOWN_REDIRECTOR_DOMAINS = _SHORTENER_DOMAINS | _TRACKING_REDIRECTOR_DOMAINS
 
 
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+_MAX_REDIRECT_HOPS = 4
+
+
 @lru_cache(maxsize=512)
 def _fetch_url(url: str, follow_redirects: bool = False) -> tuple[str, bool]:
     """Return (final_url_after_redirects, page_has_password_input).
 
-    A single GET serves both the redirect-resolution and password-form checks
-    so we never hit the same URL twice. Returns (url, False) on failure.
+    Redirects are walked one hop at a time rather than handed off to the
+    HTTP client's auto-follow. That lets us inspect each ``Location``
+    against :data:`_UNSAFE_FETCH_RE` / :data:`_UNSAFE_QUERY_RE` *before*
+    requesting the next URL — so a shortener whose destination matches a
+    destructive verb (``/lock``, ``?action=unsubscribe``) is never
+    actually fetched, and the chain stops at the safe hop preceding it.
 
-    ``follow_redirects`` defaults to **False**. A redirected GET completes
-    on the *target* of the redirect, so following a shortener-style hop
-    silently performs the action sitting at the end of the chain — and
-    the user-supplied URL may have looked benign while the redirect's
-    Location lands on ``/lock-account``. Callers that legitimately want
-    the final URL (the shortener-resolution path) opt in explicitly with
-    ``follow_redirects=True``.
+    With ``follow_redirects=False``, a 3xx response returns immediately
+    with the redirected URL exposed in the tuple's first element but no
+    follow-up GET — the original fetch is still made.
+
+    Caching: a single LRU entry keys on (url, follow_redirects). The
+    underlying GET is never repeated for the same key.
     """
     if not url.startswith(("http://", "https://")):
         return url, False
-    try:
-        with drawbridge.sync.stream(
-            "GET",
-            url,
-            timeout=_HTTP_TIMEOUT,
-            headers=_BROWSER_HEADERS,
-            max_response_bytes=_MAX_LINK_RESPONSE_BYTES,
-            follow_redirects=follow_redirects,
-        ) as resp:
-            final_url = str(resp.url)
-            content_type = resp.headers.get("Content-Type", "").lower()
-            if not resp.is_success or "html" not in content_type:
-                return final_url, False
-            body = _read_link_response(resp)
-    except (drawbridge.DrawbridgeError, httpx.HTTPError):
-        return url, False
-    soup = _parse_html(body)
-    return final_url, _looks_like_login(soup, body)
+
+    current = url
+    for _ in range(_MAX_REDIRECT_HOPS + 1):
+        try:
+            with drawbridge.sync.stream(
+                "GET",
+                current,
+                timeout=_HTTP_TIMEOUT,
+                headers=_BROWSER_HEADERS,
+                max_response_bytes=_MAX_LINK_RESPONSE_BYTES,
+                follow_redirects=False,
+            ) as resp:
+                if resp.status_code in _REDIRECT_STATUSES:
+                    location = resp.headers.get("Location", "")
+                    next_url = urljoin(current, location) if location else ""
+                    if not follow_redirects:
+                        return next_url or str(resp.url), False
+                    if not next_url.startswith(("http://", "https://")):
+                        return next_url or str(resp.url), False
+                    # Per-hop safety: refuse to follow into a Location
+                    # whose URL itself matches a destructive verb. The
+                    # caller still learns the would-be destination in
+                    # the returned tuple's first element.
+                    if (
+                        _UNSAFE_FETCH_RE.search(next_url)
+                        or _UNSAFE_QUERY_RE.search(next_url)
+                    ):
+                        return next_url, False
+                    current = next_url
+                    continue
+                final_url = str(resp.url)
+                content_type = resp.headers.get("Content-Type", "").lower()
+                if not resp.is_success or "html" not in content_type:
+                    return final_url, False
+                body = _read_link_response(resp)
+        except (drawbridge.DrawbridgeError, httpx.HTTPError):
+            return current, False
+        soup = _parse_html(body)
+        return final_url, _looks_like_login(soup, body)
+    # Hop budget exhausted without arriving at a final response.
+    return current, False
 
 
 # Catch credential prompts that hide behind `type="text"` plus a JS reveal,
@@ -721,10 +757,12 @@ def _read_link_response(resp: httpx.Response) -> bytes:
 
 
 def has_password_form(url: str) -> bool:
-    # Password-form detection: never follow redirects. A redirect-target
-    # GET can complete a side-effect (lock account, unsubscribe, ...) that
-    # the original URL didn't visibly express.
-    return _fetch_url(url, follow_redirects=False)[1]
+    # Follow redirects so we can see the final landing page — necessary
+    # for shorteners like t.co / l.workplace.com that 302 to the real
+    # destination. Each hop's Location is checked against the unsafe-fetch
+    # regexes before being fetched, so a redirect whose target is a
+    # destructive verb is never GET'd.
+    return _fetch_url(url, follow_redirects=True)[1]
 
 
 def resolve_final_url(url: str) -> str:

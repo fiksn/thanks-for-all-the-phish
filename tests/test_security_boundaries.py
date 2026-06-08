@@ -11,9 +11,10 @@ from tfatp.link_analysis import (
 
 
 class _Response:
-    def __init__(self, chunks: list[bytes]) -> None:
+    def __init__(self, chunks: list[bytes], status_code: int = 200) -> None:
         self.url = "https://example.com/login"
-        self.is_success = True
+        self.status_code = status_code
+        self.is_success = 200 <= status_code < 300
         self.headers = {"Content-Type": "text/html; charset=utf-8"}
         self._chunks = chunks
 
@@ -413,6 +414,71 @@ def test_action_pattern_url_is_never_fetched(monkeypatch):
     )
     link_analysis.analyze(body, check_password_form=True)
     assert fetches == []
+
+
+def test_bare_path_verb_lock_is_unsafe(monkeypatch):
+    """`/lock/` as a path segment — no `account|wallet|user|card` tail —
+    should still trip the URL-verb regex. Crypto.com's preference flips
+    use `/lock/click?upn=...` for exactly this kind of action."""
+    monkeypatch.setattr(link_analysis, "domain_age_days", lambda d: 9999)
+    fetches: list[str] = []
+    monkeypatch.setattr(
+        link_analysis, "has_password_form",
+        lambda url: fetches.append(url) or False,
+    )
+    body = "https://crypto.example/lock/click?upn=u001.opaque"
+    link_analysis.analyze(body, check_password_form=True)
+    assert fetches == []
+
+
+def test_redirect_to_action_url_is_not_followed(monkeypatch):
+    """If a shortener 302s to a destination that matches the unsafe-fetch
+    rules, the redirect must NOT be followed. Only the shortener itself
+    is fetched (once); the destructive endpoint never receives a GET.
+    """
+    import contextlib
+
+    fetched: list[str] = []
+    link_analysis._fetch_url.cache_clear()
+
+    @contextlib.contextmanager
+    def stream(method: str, url: str, **kwargs):
+        fetched.append(url)
+        if url == "https://short.example/abc":
+            yield _Response([], status_code=302)
+            return
+        # If the test logic is correct we never reach here, but provide a
+        # plausible response just in case.
+        yield _Response([b"<html><body>hi</body></html>"], status_code=200)
+
+    monkeypatch.setattr(link_analysis.drawbridge.sync, "stream", stream)
+
+    class _RedirectingResponse(_Response):
+        def __init__(self):
+            super().__init__([], status_code=302)
+            self.url = "https://short.example/abc"
+            self.headers = {
+                "Location": "https://crypto.example/lock-account?token=xyz",
+            }
+
+    @contextlib.contextmanager
+    def stream_lookup(method: str, url: str, **kwargs):
+        fetched.append(url)
+        if url == "https://short.example/abc":
+            yield _RedirectingResponse()
+            return
+        yield _Response([b"<html></html>"], status_code=200)
+
+    monkeypatch.setattr(link_analysis.drawbridge.sync, "stream", stream_lookup)
+    link_analysis._fetch_url.cache_clear()
+    final, has_pw = link_analysis._fetch_url(
+        "https://short.example/abc", follow_redirects=True,
+    )
+    # We learned where the redirect would have sent us, but did NOT
+    # actually fetch the destructive endpoint.
+    assert final == "https://crypto.example/lock-account?token=xyz"
+    assert has_pw is False
+    assert fetched == ["https://short.example/abc"]
 
 
 def test_clean_url_is_still_fetched(monkeypatch):
