@@ -149,7 +149,7 @@ def test_analyze_flags_direct_redirector_chain(monkeypatch):
     monkeypatch.setattr(
         link_analysis,
         "_fetch_url",
-        lambda url: ("https://credential-capture.com/login", False),
+        lambda url, follow_redirects=False: ("https://credential-capture.com/login", False),
     )
 
     findings = link_analysis.analyze(
@@ -169,7 +169,7 @@ def test_anchor_deception_uses_redirector_final_domain(monkeypatch):
     monkeypatch.setattr(
         link_analysis,
         "_fetch_url",
-        lambda url: ("https://credential-capture.com/login", False),
+        lambda url, follow_redirects=False: ("https://credential-capture.com/login", False),
     )
     raw = (
         b"From: Security <security@example.com>\n"
@@ -346,6 +346,89 @@ def test_lookalike_does_not_match_unrelated_idn():
     ascii_form = label.encode("idna").decode("ascii")
     res = _check_lookalike(f"{ascii_form}.com", "paypal.com", max_distance=1)
     assert not res.matched
+
+
+def test_list_unsubscribe_url_is_never_fetched(monkeypatch):
+    """RFC 8058 one-click endpoints complete the unsubscribe on a plain GET.
+    Any URL in the ``List-Unsubscribe`` header must skip every fetch path."""
+    monkeypatch.setattr(
+        link_analysis, "domain_age_days", lambda d: 9999,
+    )
+    fetches: list[str] = []
+    monkeypatch.setattr(
+        link_analysis, "has_password_form",
+        lambda url: fetches.append(url) or False,
+    )
+    raw = (
+        b"From: news@vendor.example\n"
+        b"Subject: Weekly digest\n"
+        b"List-Unsubscribe: <https://vendor.example/u/abc?token=xyz>\n"
+        b"List-Unsubscribe-Post: List-Unsubscribe=One-Click\n"
+        b"Content-Type: text/html\n"
+        b"\n"
+        b'<a href="https://vendor.example/u/abc?token=xyz">unsubscribe</a>'
+    )
+    body = "https://vendor.example/u/abc?token=xyz"
+    link_analysis.analyze(body, raw_rfc822=raw, check_password_form=True)
+    assert fetches == [], "no URL in List-Unsubscribe should ever be fetched"
+
+
+def test_action_prose_around_anchor_marks_url_unsafe_to_fetch(monkeypatch):
+    """When the anchor text is generic ("here") but the surrounding prose
+    is clearly an action ("click here to lock your account"), the URL
+    must skip the fetch — even when the URL itself reveals nothing.
+    """
+    monkeypatch.setattr(link_analysis, "domain_age_days", lambda d: 9999)
+    fetches: list[str] = []
+    monkeypatch.setattr(
+        link_analysis, "has_password_form",
+        lambda url: fetches.append(url) or False,
+    )
+    raw = (
+        b"From: support@vendor.example\n"
+        b"Subject: Account alert\n"
+        b"Content-Type: text/html\n"
+        b"\n"
+        b"<p>If you did not make this request, please "
+        b'<a href="https://short.example/abc123">click here</a> '
+        b"to lock your account.</p>"
+    )
+    body = "click here https://short.example/abc123 to lock your account"
+    link_analysis.analyze(body, raw_rfc822=raw, check_password_form=True)
+    assert fetches == [], "action prose around an anchor must suppress its fetch"
+
+
+def test_action_pattern_url_is_never_fetched(monkeypatch):
+    """A URL whose own path matches an action verb (`/lock-account`,
+    `?action=unsubscribe`) is unsafe even with no surrounding context."""
+    monkeypatch.setattr(link_analysis, "domain_age_days", lambda d: 9999)
+    fetches: list[str] = []
+    monkeypatch.setattr(
+        link_analysis, "has_password_form",
+        lambda url: fetches.append(url) or False,
+    )
+    body = (
+        "https://crypto.example/lock-account?token=xyz "
+        "https://other.example/dashboard?action=unsubscribe&u=42"
+    )
+    link_analysis.analyze(body, check_password_form=True)
+    assert fetches == []
+
+
+def test_clean_url_is_still_fetched(monkeypatch):
+    """Sanity: a plain link with no action signals still gets the
+    password-form fetch, otherwise we'd never detect any."""
+    monkeypatch.setattr(link_analysis, "domain_age_days", lambda d: 9999)
+    fetches: list[str] = []
+    monkeypatch.setattr(
+        link_analysis, "has_password_form",
+        lambda url: fetches.append(url) or False,
+    )
+    link_analysis.analyze(
+        "Check out https://clean.example/blog/post-42",
+        check_password_form=True,
+    )
+    assert fetches == ["https://clean.example/blog/post-42"]
 
 
 def test_double_scheme_url_does_not_produce_false_warnings(monkeypatch):

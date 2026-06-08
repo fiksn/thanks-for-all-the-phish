@@ -1,0 +1,21 @@
+# Keep the build context lean — only pyproject.toml, uv.lock, and tfatp/
+# need to enter the build stages.
+.git
+.github
+.venv
+.ruff_cache
+__pycache__
+*.pyc
+.claude
+tests
+docs
+README.md
+Dockerfile
+.dockerignore
+.gitignore
+# Local secrets and state — never bake into an image
+client_secret*.json
+token.json
+service_account.json
+config.toml
+*.eml

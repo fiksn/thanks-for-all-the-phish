@@ -234,21 +234,169 @@ def _parse_html(content: str | bytes) -> BeautifulSoup:
         return BeautifulSoup("", "html.parser")
 
 
-# Path / query substrings that strongly suggest a URL whose GET triggers a
-# state-changing action — unsubscribe, opt-out, list-remove, mailing-list
-# preference flips. RFC 8058 one-click unsubscribe explicitly uses a plain
-# GET to complete the action, so fetching one of these inadvertently
-# removes the recipient from a list. We treat any match as "do not fetch".
+# Path / query substrings that strongly suggest a URL whose GET would
+# trigger a destructive or state-changing side effect: a one-click
+# unsubscribe, an account lock, an invitation accept, a password-reset
+# token redemption. Email senders ship these as plain links because the
+# user is *expected* to click; a phish-scanner fetching them blind
+# completes the action on the recipient's behalf, which is much worse
+# than producing no signal. We treat any match here as "do not fetch".
+#
+# The verb is the dangerous part. We anchor on a delimiter before and a
+# delimiter after the keyword so substrings buried inside larger words
+# (e.g. "documentation" doesn't trip "men", "stocklock" doesn't trip
+# "lock") stay clean. Account-state and confirmation verbs require a
+# specific tail (`account|wallet|user|email|...`) to narrow further.
 _UNSAFE_FETCH_RE = re.compile(
-    r"(?:^|[/?&_-])(?:"
-    r"unsubscribe|opt[-_]?out|optout|"
+    r"(?:^|[/?&_=-])(?:"
+    # --- Mailing list opt-out / preference flip ---
+    r"unsubscribe|unsub|opt[-_]?out|optout|"
     r"list[-_]?remove|remove[-_]?me|"
     r"leave[-_]?list|stop[-_]?email|"
-    r"unsub|email-?prefs?|email-?settings|"
-    r"manage[-_]?subscription"
+    r"email[-_]?prefs?|email[-_]?settings|"
+    r"manage[-_]?subscription|"
+    # --- Account-state changes (lock/freeze/suspend/delete account) ---
+    r"lock[-_]?(?:account|wallet|user|card)|"
+    r"unlock[-_]?(?:account|wallet|user|card)|"
+    r"freeze[-_]?(?:account|wallet|user|card)|"
+    r"suspend[-_]?(?:account|wallet|user)|"
+    r"disable[-_]?(?:account|wallet|user|2fa|mfa)|"
+    r"deactivate(?:[-_]?account)?|"
+    r"close[-_]?account|"
+    r"delete[-_]?account|"
+    r"block[-_]?(?:account|user|sender)|"
+    # --- Confirmation / verification one-click (token-bound) ---
+    r"confirm[-_]?(?:email|login|account|payment|order|"
+    r"subscription|signup|registration|address|delivery|booking)|"
+    r"verify[-_]?(?:email|account|identity|phone|address|login)|"
+    r"activate[-_]?(?:account|email|user|subscription)|"
+    r"validate[-_]?(?:email|account|address)|"
+    # --- Password / token-reset flows (click burns the token) ---
+    r"reset[-_]?password|password[-_]?reset|"
+    r"recover[-_]?(?:account|password)|account[-_]?recovery|"
+    r"forgot[-_]?password|"
+    # --- Invitations and access requests ---
+    r"accept[-_]?(?:invite|invitation|request)|"
+    r"decline[-_]?(?:invite|invitation|request)|"
+    r"approve[-_]?(?:request|invite|access|signin|login|payment)|"
+    r"reject[-_]?(?:request|invite|access|signin|login)|"
+    r"join[-_]?(?:team|workspace|organi[sz]ation)|"
+    # --- Transactional one-clicks ---
+    r"cancel[-_]?(?:order|payment|subscription|booking|reservation)|"
+    r"refund[-_]?(?:request|order)|"
+    r"pay[-_]?now|"
+    # --- "Wasn't me" / report flows ---
+    r"report[-_]?(?:fraud|phish|abuse|not[-_]?me|wasn[-_]?t[-_]?me)|"
+    r"not[-_]?me|wasn[-_]?t[-_]?me"
     r")(?:[/?&_=]|$)",
     re.IGNORECASE,
 )
+
+# Generic ?action=<verb>, ?do=<verb>, ?cmd=<verb> patterns. Mailing
+# systems and SaaS apps frequently expose dispatchers behind a single
+# script that branches on a query value, e.g. `?do=unsubscribe`.
+_UNSAFE_QUERY_RE = re.compile(
+    r"[?&](?:action|do|cmd|op|command|task|method)="
+    r"(?:confirm|verify|validate|approve|reject|"
+    r"lock|unlock|freeze|suspend|disable|deactivate|"
+    r"unsubscribe|subscribe|delete|remove|cancel|"
+    r"activate|reset|recover|"
+    r"accept|decline|join|leave)\b",
+    re.IGNORECASE,
+)
+
+# Action verbs in human prose. The URL might be opaque (a tracking
+# token, a vanity shortener) and the anchor text might be generic
+# ("here", "click", "this link"), so the only signal of intent is in the
+# *prose around the link*. We climb to a block-level ancestor (paragraph,
+# table cell, list item) and look for action verbs in that block's text.
+# False positives only reduce signal — they never trigger an action.
+_UNSAFE_PROSE_RE = re.compile(
+    r"(?ix) (?:^|\b) (?:"
+    # mailing-list opt-out
+    r"unsubscribe | opt[-_\s]?out | remove\s+me |"
+    r"leave\s+(?:this\s+)?list | stop\s+receiving |"
+    r"email\s+preferences | manage\s+(?:your\s+)?subscription |"
+    # account state changes
+    r"lock\s+(?:your\s+|my\s+|the\s+)?(?:account|wallet|card) |"
+    r"unlock\s+(?:your\s+|my\s+|the\s+)?(?:account|wallet|card) |"
+    r"freeze\s+(?:your\s+|my\s+|the\s+)?(?:account|wallet|card) |"
+    r"suspend\s+(?:your\s+|my\s+)?account |"
+    r"close\s+(?:your\s+|my\s+)?account |"
+    r"deactivate\s+(?:your\s+|my\s+)?account |"
+    r"delete\s+(?:your\s+|my\s+)?account |"
+    r"disable\s+(?:2fa|mfa|account) |"
+    # confirmation / verification
+    r"confirm\s+(?:your\s+)?"
+    r"(?:email|login|sign[-_\s]?in|account|order|"
+    r"payment|subscription|address|signup|registration) |"
+    r"verify\s+(?:your\s+)?(?:email|account|identity|phone|address|login) |"
+    r"activate\s+(?:your\s+)?(?:account|email|subscription) |"
+    r"validate\s+(?:your\s+)?(?:email|account) |"
+    # password / token reset
+    r"reset\s+(?:your\s+)?password | password\s+reset |"
+    r"recover\s+(?:your\s+)?(?:account|password) |"
+    r"forgot\s+(?:your\s+)?password |"
+    # invite / approval
+    r"accept\s+(?:this\s+|the\s+)?(?:invite|invitation|request) |"
+    r"decline\s+(?:this\s+|the\s+)?(?:invite|invitation|request) |"
+    r"approve\s+(?:this\s+|the\s+)?"
+    r"(?:request|sign[-_\s]?in|login|payment|access) |"
+    r"reject\s+(?:this\s+|the\s+)?(?:request|sign[-_\s]?in|login|access) |"
+    r"join\s+(?:the\s+|this\s+)?(?:team|workspace|organi[sz]ation) |"
+    # transactional one-clicks
+    r"cancel\s+(?:this\s+|your\s+)?(?:order|payment|subscription|booking) |"
+    r"pay\s+now |"
+    # "wasn't me" / report flows
+    r"this\s+was(?:n[''‘’]?t|\s+not)\s+me | wasn[''‘’]?t\s+me"
+    r") (?:$|\b)"
+)
+
+
+def _collect_action_context_urls(raw_rfc822: bytes | None) -> set[str]:
+    """Return href URLs whose containing block (paragraph, table cell,
+    list item) carries an action verb in its prose.
+
+    The anchor itself is often a generic word ("here", "click", "this
+    link") that reveals nothing about the click target. Widening the
+    inspection to the block lets us recognise "...click here to lock
+    your account." even when the link text alone says nothing. Every
+    anchor inside a block that contains an action verb is flagged, so
+    multi-link blocks get a conservative treatment: skip the fetch.
+    """
+    if raw_rfc822 is None:
+        return set()
+    out: set[str] = set()
+    try:
+        msg = email.message_from_bytes(raw_rfc822, policy=policy.default)
+    except Exception:  # noqa: BLE001 — malformed bytes shouldn't break analysis
+        return out
+    parts = msg.walk() if msg.is_multipart() else [msg]
+    block_tags = {"p", "li", "td", "th", "div", "blockquote", "section", "body"}
+    for part in parts:
+        if part.get_content_type() != "text/html":
+            continue
+        try:
+            html = part.get_content()
+        except (LookupError, UnicodeDecodeError):
+            continue
+        soup = _parse_html(html)
+        for a in soup.find_all("a", href=True):
+            href = _normalize_href(a["href"])
+            if not href.lower().startswith(("http://", "https://")):
+                continue
+            # Climb to a block-level ancestor (bounded so a deeply-nested
+            # inline doesn't grab the whole document).
+            ctx = a.parent
+            hops = 0
+            while ctx is not None and ctx.name not in block_tags and hops < 6:
+                ctx = ctx.parent
+                hops += 1
+            container = ctx if ctx is not None else a
+            text = " ".join(container.stripped_strings)
+            if _UNSAFE_PROSE_RE.search(text):
+                out.add(href)
+    return out
 
 
 def _extract_unsubscribe_urls(raw_rfc822: bytes | None) -> set[str]:
@@ -273,13 +421,14 @@ def _extract_unsubscribe_urls(raw_rfc822: bytes | None) -> set[str]:
 
 
 def _is_unsafe_to_fetch(url: str, list_unsubscribe_urls: set[str]) -> bool:
-    """True when fetching ``url`` is likely to trigger a side effect we don't
-    want — primarily unsubscribe-style actions, but also any URL listed in
-    the message's ``List-Unsubscribe`` header.
+    """True when fetching ``url`` is likely to trigger a destructive side
+    effect — unsubscribe, account lock, password-reset token redemption,
+    invitation accept/decline, payment confirmation, etc. — or when the
+    URL appears in the message's ``List-Unsubscribe`` header.
     """
     if url in list_unsubscribe_urls:
         return True
-    return bool(_UNSAFE_FETCH_RE.search(url))
+    return bool(_UNSAFE_FETCH_RE.search(url) or _UNSAFE_QUERY_RE.search(url))
 
 
 def extract_links(text: str) -> list[str]:
@@ -485,11 +634,19 @@ _KNOWN_REDIRECTOR_DOMAINS = _SHORTENER_DOMAINS | _TRACKING_REDIRECTOR_DOMAINS
 
 
 @lru_cache(maxsize=512)
-def _fetch_url(url: str) -> tuple[str, bool]:
+def _fetch_url(url: str, follow_redirects: bool = False) -> tuple[str, bool]:
     """Return (final_url_after_redirects, page_has_password_input).
 
     A single GET serves both the redirect-resolution and password-form checks
     so we never hit the same URL twice. Returns (url, False) on failure.
+
+    ``follow_redirects`` defaults to **False**. A redirected GET completes
+    on the *target* of the redirect, so following a shortener-style hop
+    silently performs the action sitting at the end of the chain — and
+    the user-supplied URL may have looked benign while the redirect's
+    Location lands on ``/lock-account``. Callers that legitimately want
+    the final URL (the shortener-resolution path) opt in explicitly with
+    ``follow_redirects=True``.
     """
     if not url.startswith(("http://", "https://")):
         return url, False
@@ -500,6 +657,7 @@ def _fetch_url(url: str) -> tuple[str, bool]:
             timeout=_HTTP_TIMEOUT,
             headers=_BROWSER_HEADERS,
             max_response_bytes=_MAX_LINK_RESPONSE_BYTES,
+            follow_redirects=follow_redirects,
         ) as resp:
             final_url = str(resp.url)
             content_type = resp.headers.get("Content-Type", "").lower()
@@ -563,11 +721,17 @@ def _read_link_response(resp: httpx.Response) -> bytes:
 
 
 def has_password_form(url: str) -> bool:
-    return _fetch_url(url)[1]
+    # Password-form detection: never follow redirects. A redirect-target
+    # GET can complete a side-effect (lock account, unsubscribe, ...) that
+    # the original URL didn't visibly express.
+    return _fetch_url(url, follow_redirects=False)[1]
 
 
 def resolve_final_url(url: str) -> str:
-    return _fetch_url(url)[0]
+    # Shortener resolution: caller is asking specifically for the final
+    # URL after the redirect chain, so following is opt-in here. Callers
+    # gate this themselves (only known redirectors trigger it).
+    return _fetch_url(url, follow_redirects=True)[0]
 
 
 def analyze(
@@ -586,8 +750,25 @@ def analyze(
       the link's server, so your IP isn't exposed; redirectors get a generic
       "not resolved" warning instead.
     """
+    # Build the "do not fetch" set once. Three signals contribute:
+    #   1. URLs in the `List-Unsubscribe` header (RFC 8058 one-click).
+    #   2. URL path/query patterns we recognise as state-changing.
+    #   3. Anchor whose containing paragraph carries an action verb
+    #      ("click here to lock your account") — surrounding prose is
+    #      often the only intent signal when the URL itself is opaque.
+    # Any URL in this set will skip `has_password_form` (and any other
+    # GET) even when phase 3 of the gate is enabled.
+    do_not_fetch: set[str] = set()
+    if check_password_form and raw_rfc822 is not None:
+        do_not_fetch |= _extract_unsubscribe_urls(raw_rfc822)
+        do_not_fetch |= _collect_action_context_urls(raw_rfc822)
+
     findings: list[LinkFinding] = []
     seen_urls: set[str] = set()
+
+    def _fetch_ok(url: str) -> bool:
+        return check_password_form and not _is_unsafe_to_fetch(url, do_not_fetch)
+
     for url in extract_links(text):
         if url in seen_urls:
             continue
@@ -595,7 +776,7 @@ def analyze(
         findings.append(_link_finding(
             url, young_domain_days=young_domain_days,
             check_link_domain_age=check_link_domain_age,
-            check_password_form=check_password_form,
+            check_password_form=_fetch_ok(url),
         ))
     if raw_rfc822 is not None:
         subject = ""
@@ -611,14 +792,16 @@ def analyze(
             f = _link_finding(
                 url, young_domain_days=young_domain_days,
                 check_link_domain_age=check_link_domain_age,
-                check_password_form=check_password_form,
+                check_password_form=_fetch_ok(url),
             )
             # Surface origin so the analysis banner makes it clear the URL came
             # from a place a recipient would not normally expect to see one.
             f.warnings.insert(0, UrlInSubject(domain=f.domain))
             findings.append(f)
         _attach_anchor_deception_warnings(
-            findings, raw_rfc822, resolve_redirectors=check_password_form
+            findings, raw_rfc822,
+            resolve_redirectors=check_password_form,
+            do_not_fetch=do_not_fetch,
         )
         _attach_message_warnings(findings, raw_rfc822, text)
     return findings
@@ -740,7 +923,10 @@ def _extract_html_anchors(raw_rfc822: bytes) -> list[tuple[str, str]]:
 
 
 def _attach_anchor_deception_warnings(
-    findings: list[LinkFinding], raw_rfc822: bytes, resolve_redirectors: bool = True
+    findings: list[LinkFinding],
+    raw_rfc822: bytes,
+    resolve_redirectors: bool = True,
+    do_not_fetch: set[str] | frozenset[str] = frozenset(),
 ) -> None:
     """For each <a href=X>...text-with-URL...</a> where the displayed URL's
     registrable domain differs from X's, append a warning to the finding for X.
@@ -749,6 +935,10 @@ def _attach_anchor_deception_warnings(
     redirects: if the final domain matches the displayed one, suppress the
     warning (legitimate short link). When `resolve_redirectors` is False, no
     fetch happens, so shortener cases yield a plain displayed/href mismatch.
+
+    ``do_not_fetch`` lists URLs that must never be GET'd regardless of
+    the redirector flag — typically because the surrounding prose or
+    URL pattern indicates the click would trigger an action.
     """
     findings_by_url = {f.url: f for f in findings}
     for href, anchor_text in _extract_html_anchors(raw_rfc822):
@@ -763,7 +953,15 @@ def _attach_anchor_deception_warnings(
             disp_domain = registrable_domain(urlparse(displayed).hostname or "")
             if not disp_domain or disp_domain == href_domain:
                 continue
-            if _is_known_redirector(href_host, href_domain) and resolve_redirectors:
+            href_unsafe = (
+                href in do_not_fetch
+                or _is_unsafe_to_fetch(href, do_not_fetch)
+            )
+            if (
+                _is_known_redirector(href_host, href_domain)
+                and resolve_redirectors
+                and not href_unsafe
+            ):
                 final = resolve_final_url(href)
                 final_domain = registrable_domain(urlparse(final).hostname or "")
                 if final_domain == disp_domain:
