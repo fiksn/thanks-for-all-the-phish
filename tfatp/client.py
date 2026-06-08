@@ -17,6 +17,7 @@ class Message:
     subject: str
     snippet: str
     date: str
+    message_id: str  # RFC 822 Message-Id header
 
     @classmethod
     def from_api(cls, payload: dict[str, Any]) -> "Message":
@@ -28,6 +29,7 @@ class Message:
             subject=headers.get("subject", ""),
             snippet=payload.get("snippet", ""),
             date=headers.get("date", ""),
+            message_id=headers.get("message-id", ""),
         )
 
 
@@ -83,7 +85,7 @@ class GmailClient:
             self._service.users()
             .messages()
             .get(userId=self._user_id, id=message_id, format="metadata",
-                 metadataHeaders=["From", "Subject", "Date"])
+                 metadataHeaders=["From", "Subject", "Date", "Message-Id"])
             .execute()
         )
         return Message.from_api(payload)

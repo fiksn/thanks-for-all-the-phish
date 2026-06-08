@@ -234,6 +234,54 @@ def _parse_html(content: str | bytes) -> BeautifulSoup:
         return BeautifulSoup("", "html.parser")
 
 
+# Path / query substrings that strongly suggest a URL whose GET triggers a
+# state-changing action — unsubscribe, opt-out, list-remove, mailing-list
+# preference flips. RFC 8058 one-click unsubscribe explicitly uses a plain
+# GET to complete the action, so fetching one of these inadvertently
+# removes the recipient from a list. We treat any match as "do not fetch".
+_UNSAFE_FETCH_RE = re.compile(
+    r"(?:^|[/?&_-])(?:"
+    r"unsubscribe|opt[-_]?out|optout|"
+    r"list[-_]?remove|remove[-_]?me|"
+    r"leave[-_]?list|stop[-_]?email|"
+    r"unsub|email-?prefs?|email-?settings|"
+    r"manage[-_]?subscription"
+    r")(?:[/?&_=]|$)",
+    re.IGNORECASE,
+)
+
+
+def _extract_unsubscribe_urls(raw_rfc822: bytes | None) -> set[str]:
+    """Return the set of HTTP(S) URLs from the message's ``List-Unsubscribe``
+    header. Fetching one of these can complete an unsubscribe even with a
+    plain GET (RFC 8058 one-click) — they must be excluded from any
+    network-touching check.
+    """
+    if raw_rfc822 is None:
+        return set()
+    try:
+        msg = email.message_from_bytes(raw_rfc822, policy=policy.default)
+    except Exception:  # noqa: BLE001 — malformed bytes shouldn't break analysis
+        return set()
+    out: set[str] = set()
+    for header in msg.get_all("List-Unsubscribe") or []:
+        for m in re.finditer(r"<([^>]+)>", str(header)):
+            url = m.group(1).strip()
+            if url.lower().startswith(("http://", "https://")):
+                out.add(url)
+    return out
+
+
+def _is_unsafe_to_fetch(url: str, list_unsubscribe_urls: set[str]) -> bool:
+    """True when fetching ``url`` is likely to trigger a side effect we don't
+    want — primarily unsubscribe-style actions, but also any URL listed in
+    the message's ``List-Unsubscribe`` header.
+    """
+    if url in list_unsubscribe_urls:
+        return True
+    return bool(_UNSAFE_FETCH_RE.search(url))
+
+
 def extract_links(text: str) -> list[str]:
     """Return unique URLs in text, preserving first-occurrence order."""
     seen: set[str] = set()
@@ -585,10 +633,19 @@ def _link_finding(
 ) -> LinkFinding:
     host = urlparse(url).hostname or ""
     domain = registrable_domain(host) if host else ""
-    age = domain_age_days(domain) if (domain and check_link_domain_age) else None
+    # A real registrable domain always contains a dot. A URL like
+    # `https://https//www.finance.si/...` — produced by trackers that
+    # double-prefix the scheme — gets parsed as host="https"/domain="https".
+    # Skip RDAP, password-form fetch, and warning emission for such
+    # not-actually-a-domain strings; the finding is still recorded so
+    # the URL is known to the defang pipeline.
+    real_domain = "." in domain
+    if not real_domain:
+        return LinkFinding(url, host, domain, None, False, [])
+    age = domain_age_days(domain) if check_link_domain_age else None
     pwd = has_password_form(url) if check_password_form else False
     warnings: list[Warning] = []
-    if check_link_domain_age and domain:
+    if check_link_domain_age:
         if age is None:
             warnings.append(YoungDomain(domain=domain, age_days=None))
         elif age < young_domain_days:

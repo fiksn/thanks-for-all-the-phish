@@ -348,6 +348,33 @@ def test_lookalike_does_not_match_unrelated_idn():
     assert not res.matched
 
 
+def test_double_scheme_url_does_not_produce_false_warnings(monkeypatch):
+    """Trackers that double-prefix ``https://`` produce strings like
+    ``https://https//host/...`` where urlparse extracts host="https".
+    Such not-actually-a-domain values must not trigger RDAP, password-form
+    fetch, or any YoungDomain warning. The finding is still emitted so
+    the defang pipeline knows about the URL.
+    """
+    # Fail loud if the analyzer tries to fetch the URL or look up the
+    # bogus domain — the whole point of this test is that neither runs.
+    monkeypatch.setattr(
+        link_analysis, "domain_age_days",
+        lambda d: (_ for _ in ()).throw(AssertionError(f"RDAP called for {d!r}")),
+    )
+    monkeypatch.setattr(
+        link_analysis, "has_password_form",
+        lambda u: (_ for _ in ()).throw(AssertionError(f"fetched {u!r}")),
+    )
+
+    body = "Visit https://https//www.finance.si/page?utm=x for details."
+    findings = link_analysis.analyze(body, check_link_domain_age=True, check_password_form=True)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.url.startswith("https://https//")
+    assert f.domain == "https"
+    assert f.warnings == []
+
+
 def test_lookalike_charges_www_prefix_as_one_edit():
     # `www-acme.io` would otherwise be 4 raw edits from `acme.io`. Charging
     # the glued-in `www-` as a single edit brings it back within threshold.

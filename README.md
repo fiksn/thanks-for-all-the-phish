@@ -527,6 +527,69 @@ python -m tfatp.cli.diff_message <id> --config other.toml          # alt config
    skipped; mail from yourself gets rewritten.
 6. **Open up.** Set `rewrite_only_from = [".*"]` once you trust the round-trip.
 
+## Running in Docker
+
+A minimal multi-stage image is included. `pyproject.toml` + `uv.lock` are
+installed in a builder stage; the runtime stage only carries Python 3.13
+slim, the resolved venv, and the `tfatp/` package. The image runs as a
+non-root user (uid 10001).
+
+Build:
+
+```bash
+docker build -t tfatp:latest .
+```
+
+Two on-host directories matter:
+
+- **Config** (`/etc/tfatp/config.toml` inside the container, mounted
+  read-only). The paths inside this file must point at the **state
+  directory** below — e.g.
+  `token_file = "/var/lib/tfatp/token.json"` and
+  `service_account_file = "/var/lib/tfatp/service_account.json"`.
+- **State** (`/var/lib/tfatp` inside the container, mounted read-write).
+  Holds `token.json` (OAuth refresh token), `client_secret.json` or
+  `service_account.json`, and anything else the runtime writes back.
+  Declared as a `VOLUME` so anonymous volumes work; for production use
+  a host bind-mount with predictable ownership (uid 10001).
+
+DWD (service-account) example, which doesn't need a browser to
+authenticate:
+
+```bash
+mkdir -p ./tfatp-state
+cp service_account.json ./tfatp-state/   # keep this file 0600
+chown -R 10001:10001 ./tfatp-state
+
+docker run --rm -it \
+    -v $PWD/config.toml:/etc/tfatp/config.toml:ro \
+    -v $PWD/tfatp-state:/var/lib/tfatp:rw \
+    tfatp:latest
+```
+
+OAuth mode needs an interactive browser login the first time. The
+recommended flow:
+
+1. Run the auth dance once **outside** Docker on a workstation
+   (`python -m tfatp` from the repo root). A `token.json` is written.
+2. Copy `token.json` and `client_secret.json` into `./tfatp-state/`.
+3. Start the container as above — the refresh token in `token.json`
+   is what the daemon uses; no browser is involved.
+
+To run a different CLI in the same image, override the entrypoint
+or the command. For example, the bulk phishing-test injector:
+
+```bash
+docker run --rm \
+    -v $PWD/config.toml:/etc/tfatp/config.toml:ro \
+    -v $PWD/tfatp-state:/var/lib/tfatp:ro \
+    -v $PWD/drill.eml:/tmp/drill.eml:ro \
+    --entrypoint python tfatp:latest \
+    -m tfatp.cli.phishing_test \
+    --config /etc/tfatp/config.toml \
+    --dry-run /tmp/drill.eml
+```
+
 ## Library overview
 
 ```python

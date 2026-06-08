@@ -1,47 +1,46 @@
 import dataclasses
+import email
 import sys
+from email import policy
 
+from tfatp import loop_guard
 from tfatp.client import GmailClient, Message
 from tfatp.config import load_config
-from tfatp.dkim_verify import verify as verify_dkim
 from tfatp.idle_watcher import IdleWatcher
-from tfatp.link_analysis import analyze, annotate, message_body_text
 from tfatp.rewriter import maybe_rewrite_new_mail
 from tfatp.smtp_verify import can_smtp_callout
 from tfatp.watcher import MailWatcher
 
 
-def _print_message(prefix: str, client: GmailClient, msg: Message) -> None:
-    """Print metadata + per-link findings to stdout. Body content is *not*
-    echoed: a watcher daemon writes to whatever stdout the operator pointed
-    it at, often a long-lived log file with weaker access controls than the
-    mailbox itself. Leaking message bodies there would re-expose every
-    rewritten phish (and every legitimate mail it processed alongside) to
-    anyone with read on the log.
+def _print_message(prefix: str, client: GmailClient, msg: Message) -> bool:
+    """Identity-only watcher log: print the message's From / Subject /
+    Message-Id / Date / Gmail id. Returns True if the caller should
+    continue with the rewriter, False if the message is our own rewrite
+    and should be skipped end-to-end.
+
+    Detection-side noise (DKIM verdict, link findings, phase outcomes)
+    is the rewriter's job; surfacing it here too just doubled the API
+    calls and the cognitive load. The rewritten message carries the same
+    information in `X-Checked-*` headers and in the banner.
     """
+    # Loop-guard FIRST. Skipping our own rewrites before the rewriter call
+    # avoids re-fetching the raw bytes there and keeps the log honest —
+    # "own rewrite, skipped" rather than treating it as fresh inbound.
     raw = client.get_raw_message(msg.id)
-    dkim_result = verify_dkim(raw)
-    body = message_body_text(raw)
-    findings = analyze(
-        body,
-        young_domain_days=client.config.young_domain_days,
-        raw_rfc822=raw,
-    )
+    parsed = email.message_from_bytes(raw, policy=policy.default)
+    if loop_guard.is_own_rewrite(parsed, client.config.loop_guard_secret):
+        print(f"[tfatp] {prefix}: own rewrite (id={msg.id}), skipped")
+        return False
 
     print(f"\n=== {prefix} ===")
     print(f"  id      : {msg.id}")
-    print(f"  date    : {msg.date}")
+    if msg.message_id:
+        print(f"  mid     : {msg.message_id}")
+    if msg.date:
+        print(f"  date    : {msg.date}")
     print(f"  from    : {msg.sender}")
     print(f"  subject : {msg.subject}")
-    print(f"  dkim    : {dkim_result.status} ({dkim_result.detail})")
-
-    if findings:
-        print("  links   :")
-        for f in findings:
-            age = f"{f.age_days}d" if f.age_days is not None else "unknown"
-            flags = ", ".join(str(w) for w in f.warnings) if f.warnings else "ok"
-            print(f"    - {f.url}  (domain={f.domain}, age={age}, {flags})")
-    print(f"  body    : {len(body)} chars (not shown)")
+    return True
 
 
 def main(argv: list[str]) -> int:
@@ -93,7 +92,11 @@ def main(argv: list[str]) -> int:
         for mid in ids:
             msg = client.get_message(mid)
             print(f"[tfatp] processing id={msg.id} from={msg.sender!r} subject={msg.subject!r}")
-            _print_message("BACKFILL", client, msg)
+            if not _print_message("BACKFILL", client, msg):
+                # Own rewrite — `_print_message` already reported it. Skip
+                # the rewriter call so we don't repeat the loop-guard work
+                # on the rewriter side.
+                continue
             try:
                 maybe_rewrite_new_mail(client, msg.id)
             except Exception as exc:  # noqa: BLE001
@@ -122,7 +125,8 @@ def main(argv: list[str]) -> int:
     @watcher.on_new_mail
     def show(msg: Message) -> None:
         print(f"[tfatp] processing id={msg.id} from={msg.sender!r} subject={msg.subject!r}")
-        _print_message("NEW MAIL", client, msg)
+        if not _print_message("NEW MAIL", client, msg):
+            return
         # Best-effort: any failure here must not crash the watcher loop.
         try:
             maybe_rewrite_new_mail(client, msg.id)
