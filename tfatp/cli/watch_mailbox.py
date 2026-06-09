@@ -1,6 +1,7 @@
 import dataclasses
 import email
 import sys
+from datetime import UTC, datetime
 from email import policy
 
 from tfatp import loop_guard
@@ -9,7 +10,28 @@ from tfatp.config import load_config
 from tfatp.idle_watcher import IdleWatcher
 from tfatp.rewriter import maybe_rewrite_new_mail
 from tfatp.smtp_verify import can_smtp_callout
+from tfatp.sync_state import (
+    SyncState,
+    effective_resume_at,
+    state_file_path,
+)
 from tfatp.watcher import MailWatcher
+
+
+def _parse_sync_from(raw: str) -> datetime | None:
+    """Parse a ``--sync-from`` argument into a UTC-aware datetime, or
+    print an error and return None. Accepts both ``Z`` and ``+HH:MM``
+    UTC suffixes; a naive value is treated as UTC."""
+    try:
+        s = raw[:-1] if raw.endswith("Z") else raw
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        print(f"[tfatp] --sync-from: invalid ISO 8601 timestamp {raw!r}",
+              file=sys.stderr)
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 def _print_message(prefix: str, client: GmailClient, msg: Message) -> bool:
@@ -48,6 +70,8 @@ def main(argv: list[str]) -> int:
     mode = "idle"
     cfg_path = "config.toml"
     backfill = 0
+    reset_state = False
+    sync_from: datetime | None = None
     i = 0
     while i < len(args):
         a = args[i]
@@ -61,6 +85,20 @@ def main(argv: list[str]) -> int:
             backfill = int(args[i])
         elif a.startswith("--rewrite-latest="):
             backfill = int(a.split("=", 1)[1])
+        elif a == "--reset-state":
+            reset_state = True
+        elif a == "--sync-from":
+            i += 1
+            if i >= len(args):
+                print("[tfatp] --sync-from needs an ISO 8601 timestamp", file=sys.stderr)
+                return 2
+            sync_from = _parse_sync_from(args[i])
+            if sync_from is None:
+                return 2
+        elif a.startswith("--sync-from="):
+            sync_from = _parse_sync_from(a.split("=", 1)[1])
+            if sync_from is None:
+                return 2
         else:
             cfg_path = a
         i += 1
@@ -85,6 +123,29 @@ def main(argv: list[str]) -> int:
             cfg = dataclasses.replace(cfg, smtp_verify=False)
 
     client = GmailClient(cfg)
+
+    # Load (or reset) persisted sync state. The watermark and a UTC
+    # midnight floor decide where the polling watcher resumes; for IDLE
+    # the watermark is informational only (IDLE re-IDLEs from now), but
+    # we still update it on each processed message so the next polling
+    # restart has somewhere to begin.
+    state = SyncState.load(state_file_path(cfg.state_dir))
+    if reset_state:
+        state.reset()
+        print(f"[tfatp] state reset: {state_file_path(cfg.state_dir)}")
+    wm = state.get(cfg.user)
+    resume_at = effective_resume_at(wm, override=sync_from)
+    initial_history_id = (
+        wm.history_id if wm is not None and not wm.is_history_expired() else None
+    )
+    if sync_from is not None:
+        # Operator explicitly asked to re-scan from an instant — drop any
+        # stored history_id so we use the timestamp path instead.
+        initial_history_id = None
+    print(
+        f"[tfatp] state: resume_at={resume_at.isoformat()} "
+        f"history_id={initial_history_id or '(fresh)'}"
+    )
 
     if backfill > 0:
         ids = client.list_message_ids(max_results=backfill)
@@ -118,9 +179,15 @@ def main(argv: list[str]) -> int:
                 f"[tfatp] IMAP IDLE unavailable ({detail}); falling back to history polling. "
                 f"Enable IMAP at Settings → Forwarding and POP/IMAP to use IDLE."
             )
-            watcher = MailWatcher(client, poll_interval=cfg.poll_interval)
+            watcher = MailWatcher(
+                client, poll_interval=cfg.poll_interval,
+                initial_history_id=initial_history_id,
+            )
     else:
-        watcher = MailWatcher(client, poll_interval=cfg.poll_interval)
+        watcher = MailWatcher(
+            client, poll_interval=cfg.poll_interval,
+            initial_history_id=initial_history_id,
+        )
 
     @watcher.on_new_mail
     def show(msg: Message) -> None:
@@ -132,6 +199,20 @@ def main(argv: list[str]) -> int:
             maybe_rewrite_new_mail(client, msg.id)
         except Exception as exc:  # noqa: BLE001
             print(f"[rewrite] failed for id={msg.id}: {exc!r}")
+        # Checkpoint after each handled message. We grab the fresh
+        # historyId regardless of whether the rewriter ran (own-rewrite
+        # skips still advance the watermark) so the resume point keeps
+        # moving forward and we don't replay the same message after a
+        # restart.
+        try:
+            state.update(
+                cfg.user,
+                history_id=client.current_history_id(),
+                processed_at=datetime.now(UTC),
+            )
+            state.save()
+        except Exception as exc:  # noqa: BLE001 — state I/O must not crash watcher
+            print(f"[tfatp] state save failed: {exc!r}", file=sys.stderr)
 
     watcher.run()
     return 0

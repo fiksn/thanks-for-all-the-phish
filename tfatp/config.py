@@ -139,6 +139,20 @@ def _rewrite_only_from(value: object, *, field: str = "rewrite_only_from") -> tu
     return tuple(out)
 
 
+def _state_dir(value: object) -> Path:
+    """Resolve the per-account state directory.
+
+    A non-empty ``state_dir`` in ``config.toml`` wins. Otherwise we hand
+    off to :func:`tfatp.sync_state.default_state_dir`, which prefers the
+    ``TFATP_STATE_DIR`` env var (set in the Docker image to
+    ``/var/lib/tfatp``) and falls back to XDG.
+    """
+    from tfatp.sync_state import default_state_dir
+    if isinstance(value, str) and value.strip():
+        return Path(value.strip())
+    return default_state_dir()
+
+
 def _user_patterns(value: object, *, field: str) -> tuple[str, ...]:
     """Parse a list of email-regex strings, validating each pattern.
 
@@ -228,6 +242,7 @@ class Config:
     admin_user: str
     include_users: tuple[str, ...]
     exclude_users: tuple[str, ...]
+    state_dir: Path
     pubsub_project_id: str
     pubsub_topic: str
     pubsub_subscription: str
@@ -314,6 +329,7 @@ def load_config(path: str | Path = "config.toml") -> Config:
         admin_user=str(raw.get("admin_user", "") or ""),
         include_users=_user_patterns(raw.get("include_users"), field="include_users"),
         exclude_users=_user_patterns(raw.get("exclude_users"), field="exclude_users"),
+        state_dir=_state_dir(raw.get("state_dir")),
         pubsub_project_id=str(raw.get("pubsub_project_id", "") or ""),
         pubsub_topic=str(raw.get("pubsub_topic", "") or ""),
         pubsub_subscription=str(raw.get("pubsub_subscription", "") or ""),

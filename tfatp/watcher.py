@@ -7,9 +7,15 @@ NewMailHook = Callable[[Message], None]
 
 
 class MailWatcher:
-    def __init__(self, client: GmailClient, poll_interval: int = 15) -> None:
+    def __init__(
+        self,
+        client: GmailClient,
+        poll_interval: int = 15,
+        initial_history_id: str | None = None,
+    ) -> None:
         self._client = client
         self._poll_interval = poll_interval
+        self._initial_history_id = initial_history_id
         self._hooks: list[NewMailHook] = []
 
     def on_new_mail(self, hook: NewMailHook) -> NewMailHook:
@@ -31,8 +37,16 @@ class MailWatcher:
                 print(f"[watcher] hook {hook.__name__} raised: {exc!r}")
 
     def run(self) -> None:
-        history_id = self._client.current_history_id()
-        print(f"[watcher] starting at historyId={history_id}, polling every {self._poll_interval}s")
+        # Resume from the persisted watermark when one was passed in; fall
+        # back to the live current historyId otherwise. We try the stored
+        # id first and let `history_since` decide whether it's still
+        # valid — Gmail returns a clear error when the cursor has expired.
+        history_id = self._initial_history_id or self._client.current_history_id()
+        origin = "resumed" if self._initial_history_id else "current"
+        print(
+            f"[watcher] starting at historyId={history_id} ({origin}), "
+            f"polling every {self._poll_interval}s"
+        )
         while True:
             try:
                 new_ids, history_id = self._client.history_since(history_id)

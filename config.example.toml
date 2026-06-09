@@ -159,6 +159,16 @@ admin_user = ""
 include_users = []
 exclude_users = []
 
+# Directory where tfatp persists sync watermarks across restarts. One JSON
+# file lives here (`sync_state.json`), keyed by workspace user, holding the
+# Gmail `historyId` and the timestamp of the last processed message. The
+# resume point on startup is clamped to UTC midnight today, so a daemon
+# down across midnight never replays yesterday's mail. Override per-host
+# when running outside Docker; the Docker image hard-codes
+# `/var/lib/tfatp` via the TFATP_STATE_DIR env var.
+#
+# state_dir = "/var/lib/tfatp"
+
 # Cloud Pub/Sub config for push-based new-mail notifications.
 # If any of these is empty, watch_domain falls back to the polling loop.
 pubsub_project_id = ""

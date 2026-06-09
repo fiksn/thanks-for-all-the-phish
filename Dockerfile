@@ -42,7 +42,8 @@ COPY --from=builder --chown=tfatp:tfatp /app /app
 # Make the venv binaries available without `uv run`.
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    TFATP_STATE_DIR=/var/lib/tfatp
 
 USER tfatp
 
